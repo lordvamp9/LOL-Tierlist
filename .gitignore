@@ -8,6 +8,7 @@
 node_modules/
 dist/
 .turbo/
+release-assets/
 
 # Compilaciones de Rust y Tauri (Crítico: evita exponer rutas de usuario y archivos de varios GB)
 src-tauri/target/
