@@ -586,6 +586,39 @@ body {
   gap: 3px;
 }
 
+.dashboard-header-flex {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.dashboard-emblem-container {
+  width: 50px;
+  height: 50px;
+  border-radius: 4px;
+  border: 1px solid #c8aa6e;
+  background: radial-gradient(circle at 35% 35%, #1c3247 0%, #0a1722 65%, #050c12 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 10px rgba(200, 170, 110, 0.35), inset 0 0 8px rgba(0, 0, 0, 0.85);
+  flex-shrink: 0;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.dashboard-emblem-container:hover {
+  transform: scale(1.05);
+  box-shadow: 0 0 14px rgba(200, 170, 110, 0.55), inset 0 0 8px rgba(0, 0, 0, 0.9);
+  border-color: #f0e6d2;
+}
+
+.dashboard-emblem-img {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.8));
+}
+
 .content-main-title {
   font-family: 'Cinzel', serif;
   font-size: 19px;

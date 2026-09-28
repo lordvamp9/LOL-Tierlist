@@ -2,6 +2,10 @@
 
 <div align="center">
 
+<img src="src/assets/img/icono.png" alt="LOL META Icon" width="128" height="128" style="border-radius: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.5);" />
+
+<br/><br/>
+
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)
 ![Tauri v2](https://img.shields.io/badge/Tauri-v2-24C8D8.svg?style=for-the-badge&logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-1.96-orange.svg?style=for-the-badge&logo=rust&logoColor=white)

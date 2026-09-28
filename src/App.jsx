@@ -5,6 +5,7 @@ import FilterControls from './components/FilterControls';
 import ChampionCard from './components/ChampionCard';
 import ChampionDetail from './components/ChampionDetail';
 import { AlertCircle, Filter, Trophy, Sparkles } from 'lucide-react';
+import iconoLogo from './assets/img/icono.png';
 import './styles/classic-client.css';
 
 // Bonus Tier lookup for the weighted formula
@@ -141,14 +142,21 @@ export default function App() {
       <main className="classic-content-area">
         <div className="content-header">
           <div className="content-title-box">
-            <h2 className="content-main-title">
-              <Trophy size={20} color="#ffdc73" />
-              TOP 5 META REAL — {activeRole}
-            </h2>
-            <p className="content-subtitle">
-              Calculado para el servidor <strong>{server}</strong> en rango <strong>{eloTier}</strong>{' '}
-              descartando picks inflados por bajo pick rate.
-            </p>
+            <div className="dashboard-header-flex">
+              <div className="dashboard-emblem-container" title="LOL META">
+                <img src={iconoLogo} alt="LOL META" className="dashboard-emblem-img" />
+              </div>
+              <div>
+                <h2 className="content-main-title">
+                  <Trophy size={20} color="#ffdc73" />
+                  TOP 5 META REAL — {activeRole}
+                </h2>
+                <p className="content-subtitle">
+                  Calculado para el servidor <strong>{server}</strong> en rango <strong>{eloTier}</strong>{' '}
+                  descartando picks inflados por bajo pick rate.
+                </p>
+              </div>
+            </div>
           </div>
         </div>
 
