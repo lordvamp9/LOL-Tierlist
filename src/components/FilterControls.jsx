@@ -24,7 +24,6 @@ export default function FilterControls({
   minPickRate,
   setMinPickRate,
   patch,
-  isCached,
 }) {
   const getRankIconUrl = (iconName) =>
     `https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/images/ranked-mini-crests/${iconName}.png`;
@@ -101,16 +100,6 @@ export default function FilterControls({
       <div className="meta-status-badges">
         <div className="badge-patch" title="Parche oficial sincronizado desde Riot Data Dragon">
           PARCHE {patch || '14.24.1'}
-        </div>
-        <div
-          className={`badge-cache ${isCached ? 'cached' : 'live'}`}
-          title={
-            isCached
-              ? `Caché Local Offline específica (cache_${server.toLowerCase()}_${eloTier.toLowerCase()}.json, TTL: 12 Horas)`
-              : 'Datos descargados y procesados para esta región y elo'
-          }
-        >
-          {isCached ? 'CACHÉ (12h)' : 'EN VIVO'}
         </div>
       </div>
     </div>

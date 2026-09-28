@@ -727,7 +727,8 @@ img[alt="Esmeralda"], img[src*="emerald"] {
   border-color: #c8aa6e;
 }
 
-.avatar-tier-badge {
+.avatar-tier-badge,
+.tier-badge {
   position: absolute;
   bottom: -3px;
   right: -3px;
@@ -760,6 +761,16 @@ img[alt="Esmeralda"], img[src*="emerald"] {
   background: #252a30;
   color: #d1d5db;
   border-color: #64748b;
+}
+.tier-C {
+  background: #1e2229;
+  color: #9ca3af;
+  border-color: #4b5563;
+}
+.tier-D {
+  background: #181b20;
+  color: #6b7280;
+  border-color: #374151;
 }
 
 /* Champion Identity Block: Ivory Serif Name & Italicized Subtitle */

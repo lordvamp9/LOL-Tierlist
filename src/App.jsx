@@ -130,7 +130,6 @@ export default function App() {
           minPickRate={minPickRate}
           setMinPickRate={setMinPickRate}
           patch={metaData?.patch}
-          isCached={metaData?.isCached}
         />
       </div>
 
