@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LOL META",
+  "version": "1.0.0",
+  "identifier": "com.vamp9.lolmeta",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "LOL META",
+        "label": "main",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 1024,
+        "minHeight": 720,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/icono.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icono.ico",
+        "installMode": "both",
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {}
+}

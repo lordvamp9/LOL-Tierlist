@@ -1,0 +1,26 @@
+# Entorno y Secretos
+.env
+.env.*
+*.pem
+*.key
+
+# Dependencias y Bundles Frontend
+node_modules/
+dist/
+.turbo/
+
+# Compilaciones de Rust y Tauri (Crítico: evita exponer rutas de usuario y archivos de varios GB)
+src-tauri/target/
+target/
+**/*.rs.bk
+
+# Caché local en disco generada por la app
+src-tauri/cache_*.json
+*.log
+
+# Archivos temporales de sistema e IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

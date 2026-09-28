@@ -1,0 +1,63 @@
+name: Release LOL META Client
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install Frontend Dependencies
+        run: npm ci || npm install
+
+      - name: Build Tauri Desktop Client & Publish GitHub Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'LOL META Release ${{ github.ref_name }}'
+          releaseBody: |
+            ## LOL META Desktop Client — Release ${{ github.ref_name }}
+            
+            ### 🎮 Novedades y Características:
+            - **Cliente Season 3 (2013):** Diseño retro clásico fiel de League of Legends.
+            - **Top 5 Meta Real:** Algoritmo ponderado anti-niche picks para el parche actual.
+            - **Filtros Funcionales:** Selector de Servidor (LAS, LAN, NA, EUW, KR, BR) y Elo (Hierro a Retador).
+            - **Caché Offline:** Persistencia local con TTL de 12 horas.
+            - **100% Vanguard Safe:** Cero inyección de memoria ni hooks; consume exclusivamente estadísticas públicas vía CDN.
+            
+            ### 📦 Descarga del Instalador:
+            Descarga el archivo ejecutable adjunto abajo (`.exe`) e instálalo en tu sistema Windows.
+          releaseDraft: false
+          prerelease: false
+          args: --verbose

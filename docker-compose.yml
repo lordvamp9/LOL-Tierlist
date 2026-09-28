@@ -1,0 +1,28 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lol-classic-meta-builder
+    working_dir: /app
+    volumes:
+      # Map host source code to container
+      - .:/app
+      # Prevent container from overwriting host node_modules
+      - /app/node_modules
+      # Persistent Cargo and Rust cache to accelerate subsequent builds
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      # Direct output mapping for binaries and installer bundle
+      - ./dist:/app/dist
+      - ./src-tauri/target/release/bundle:/app/src-tauri/target/release/bundle
+    environment:
+      - CI=true
+      - NODE_ENV=production
+    command: sh -c "npm install && npm run build && npm run tauri build"
+
+volumes:
+  cargo-cache:
+    name: lol-meta-cargo-cache
+  cargo-git:
+    name: lol-meta-cargo-git
