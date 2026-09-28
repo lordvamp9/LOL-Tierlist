@@ -17,6 +17,8 @@ target/
 **/*.rs.bk
 
 # Caché local en disco generada por la app
+cache_*.json
+**/cache_*.json
 src-tauri/cache_*.json
 *.log
 

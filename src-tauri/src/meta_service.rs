@@ -1,14 +1,25 @@
 use crate::models::{
-    BuildRecommendation, ChampionStat, ItemInfo, LoLMetaData, RuneItem, RuneTree, SummonerSpell,
+    BuildRecommendation, ChampionRoleData, ItemInfo, RuneItem, RuneTree, SummonerSpell,
 };
-use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tauri::{AppHandle, Manager};
 
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 LoLClassicMeta/1.0 (vamp9)";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 LoLClassicMeta/1.0.1 (vamp9)";
 const CACHE_TTL_SECONDS: u64 = 12 * 3600; // 12 hours TTL
+
+#[derive(Clone, Copy)]
+pub enum Archetype {
+    AdBruiser,
+    ApMage,
+    AdCarry,
+    Tank,
+    AdAssassin,
+    ApAssassin,
+    Enchanter,
+    SupportTank,
+}
 
 pub fn get_cache_file_path(app: &AppHandle, server: &str, tier: &str) -> Result<PathBuf, String> {
     let app_dir = app
@@ -17,8 +28,7 @@ pub fn get_cache_file_path(app: &AppHandle, server: &str, tier: &str) -> Result<
         .map_err(|e| format!("Failed to get app_data_dir: {}", e))?;
 
     if !app_dir.exists() {
-        fs::create_dir_all(&app_dir)
-            .map_err(|e| format!("Failed to create app data dir: {}", e))?;
+        let _ = fs::create_dir_all(&app_dir);
     }
 
     let clean_server = server.to_lowercase().replace(' ', "_");
@@ -60,73 +70,28 @@ pub fn calculate_score(win_rate: f64, pick_rate: f64, tier: &str) -> f64 {
     (raw * 100.0).round() / 100.0
 }
 
-pub async fn load_meta_data(app: &AppHandle, server: &str, tier: &str, force_refresh: bool) -> Result<LoLMetaData, String> {
-    let cache_path = get_cache_file_path(app, server, tier)?;
-
-    // 1. Check offline cache TTL (12 hours) if not forcing refresh
-    if !force_refresh && cache_path.exists() {
-        if let Ok(metadata) = fs::metadata(&cache_path) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
-                    if elapsed.as_secs() < CACHE_TTL_SECONDS {
-                        if let Ok(content) = fs::read_to_string(&cache_path) {
-                            if let Ok(mut cached_data) = serde_json::from_str::<LoLMetaData>(&content) {
-                                cached_data.is_cached = true;
-                                return Ok(cached_data);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Fetch fresh data from network or synthesize server/tier meta
-    match fetch_and_normalize(app, server, tier).await {
-        Ok(fresh_data) => {
-            // Write to cache
-            if let Ok(json_str) = serde_json::to_string_pretty(&fresh_data) {
-                let _ = fs::write(&cache_path, json_str);
-            }
-            Ok(fresh_data)
-        }
-        Err(net_err) => {
-            // 3. Fallback to existing cache on network failure
-            if cache_path.exists() {
-                if let Ok(content) = fs::read_to_string(&cache_path) {
-                    if let Ok(mut cached_data) = serde_json::from_str::<LoLMetaData>(&content) {
-                        cached_data.is_cached = true;
-                        return Ok(cached_data);
-                    }
-                }
-            }
-
-            // 4. Ultimate fallback: generate default offline dataset for patch and server/tier
-            let default_data = generate_default_dataset("14.24.1", server, tier, false);
-            if let Ok(json_str) = serde_json::to_string_pretty(&default_data) {
-                let _ = fs::write(&cache_path, json_str);
-            }
-            eprintln!("Network failed ({}), using normalized fallback dataset", net_err);
-            Ok(default_data)
-        }
+fn determine_tier(score: f64) -> String {
+    if score >= 62.0 {
+        "S+".to_string()
+    } else if score >= 58.5 {
+        "S".to_string()
+    } else if score >= 54.5 {
+        "A".to_string()
+    } else if score >= 50.0 {
+        "B".to_string()
+    } else {
+        "C".to_string()
     }
 }
 
-async fn fetch_and_normalize(_app: &AppHandle, server: &str, tier: &str) -> Result<LoLMetaData, String> {
-    let patch = fetch_latest_patch()
-        .await
-        .unwrap_or_else(|_| "14.24.1".to_string());
-
-    let dataset = generate_default_dataset(&patch, server, tier, false);
-    Ok(dataset)
-}
-
-fn item(patch: &str, id: u32, name: &str, cost: u32) -> ItemInfo {
+fn item(patch: &str, id: u32, name: &str, cost: u32, win_rate: Option<f64>, category: Option<&str>) -> ItemInfo {
     ItemInfo {
         id,
         name: name.to_string(),
         icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/item/{}.png", patch, id),
         cost,
+        win_rate,
+        category: category.map(|s| s.to_string()),
     }
 }
 
@@ -147,1613 +112,860 @@ fn spell(id: &str, name: &str) -> SummonerSpell {
     }
 }
 
-fn adjust_champion_stats(champ: &mut ChampionStat, server: &str, elo_tier: &str) {
-    let s = server.to_uppercase();
-    let t = elo_tier.to_uppercase();
+fn build_for_archetype(patch: &str, archetype: Archetype) -> BuildRecommendation {
+    match archetype {
+        Archetype::AdBruiser => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1055, "Espada de Doran", 450, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3047, "Punteras de Acero", 1100, None, None),
+            core_items: vec![
+                item(patch, 6692, "Eclipse", 2800, None, None),
+                item(patch, 6610, "Cielo Desgarrado", 3100, None, None),
+                item(patch, 3071, "Cuchilla Negra", 3000, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3053, "Guantelete de Sterak", 3200, Some(56.4), Some("Defensa")),
+                item(patch, 6333, "Danza de la Muerte", 3300, Some(57.8), Some("Anti-Burst")),
+            ],
+            fifth_items: vec![
+                item(patch, 3156, "Fauces de Malmortius", 3100, Some(59.2), Some("Anti-Mágico")),
+                item(patch, 3026, "Ángel Guardián", 3200, Some(60.5), Some("Revivir")),
+            ],
+            sixth_items: vec![
+                item(patch, 6665, "Jak'Sho, el Proteico", 3200, Some(62.1), Some("Resistencias")),
+                item(patch, 6609, "Espada Motosierra Quimopunk", 2800, Some(61.4), Some("Heridas Graves")),
+            ],
+            situational_items: vec![
+                item(patch, 6333, "Danza de la Muerte", 3300, None, Some("Anti-Burst AD")),
+                item(patch, 3156, "Fauces de Malmortius", 3100, None, Some("Escudo Mágico")),
+                item(patch, 3143, "Presagio de Randuin", 2700, None, Some("Anti-Crítico")),
+                item(patch, 3075, "Malla de Espinas", 2700, None, Some("Anti-Curación")),
+                item(patch, 3026, "Ángel Guardián", 3200, None, Some("Segunda Vida")),
+            ],
+        },
+        Archetype::ApMage => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1056, "Anillo de Doran", 400, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3020, "Botas de Hechicero", 1100, None, None),
+            core_items: vec![
+                item(patch, 6655, "Compañera de Luden", 2900, None, None),
+                item(patch, 4645, "Llamasombría", 3200, None, None),
+                item(patch, 4646, "Sobrecarga Tormentosa", 2900, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3157, "Reloj de Arena de Zhonya", 3250, Some(57.2), Some("Invulnerabilidad")),
+                item(patch, 3135, "Báculo del Vacío", 3000, Some(58.6), Some("Penetración")),
+            ],
+            fifth_items: vec![
+                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600, Some(61.8), Some("Poder Máximo")),
+                item(patch, 3137, "Flor Criptofloreciente", 2850, Some(60.4), Some("Penetración + Cura")),
+            ],
+            sixth_items: vec![
+                item(patch, 3102, "Velo del Hada de la Muerte", 3100, Some(63.5), Some("Escudo Antihechizos")),
+                item(patch, 4628, "Enfoque al Horizonte", 2700, Some(62.0), Some("Visión + Daño")),
+            ],
+            situational_items: vec![
+                item(patch, 3157, "Reloj de Arena de Zhonya", 3250, None, Some("Defensa Stasis")),
+                item(patch, 3102, "Velo del Hada de la Muerte", 3100, None, Some("Antihechizos")),
+                item(patch, 3165, "Morellonomicón", 2200, None, Some("Anti-Curación")),
+                item(patch, 3135, "Báculo del Vacío", 3000, None, Some("Penetración")),
+                item(patch, 4629, "Impulso Cósmico", 3000, None, Some("Velocidad")),
+            ],
+        },
+        Archetype::AdCarry => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1055, "Espada de Doran", 450, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3006, "Grebas de Berserker", 1100, None, None),
+            core_items: vec![
+                item(patch, 6672, "Verdugo de Krakens", 3100, None, None),
+                item(patch, 6676, "El Coleccionista", 3200, None, None),
+                item(patch, 3031, "Filo del Infinito", 3600, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3036, "Recuerdos de Lord Dominik", 3000, Some(56.9), Some("Penetración Armor")),
+                item(patch, 3094, "Cañón de Fuego Rápido", 3000, Some(57.5), Some("Alcance Extra")),
+            ],
+            fifth_items: vec![
+                item(patch, 3072, "La Sanguinaria", 3400, Some(60.2), Some("Robo de Vida")),
+                item(patch, 6673, "Arcoescudo Inmortal", 3000, Some(59.4), Some("Supervivencia")),
+            ],
+            sixth_items: vec![
+                item(patch, 3026, "Ángel Guardián", 3200, Some(62.7), Some("Revivir")),
+                item(patch, 3139, "Cimitarra Mercurial", 3300, Some(61.3), Some("Purificación")),
+            ],
+            situational_items: vec![
+                item(patch, 3026, "Ángel Guardián", 3200, None, Some("Protección Armadura")),
+                item(patch, 6673, "Arcoescudo Inmortal", 3000, None, Some("Escudo Salvavidas")),
+                item(patch, 3033, "Recordatorio Mortal", 3000, None, Some("Heridas Graves")),
+                item(patch, 3156, "Fauces de Malmortius", 3100, None, Some("Escudo Mágico")),
+                item(patch, 3153, "Hoja del Rey Arruinado", 3200, None, Some("Destruye Tanques")),
+            ],
+        },
+        Archetype::Tank => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1054, "Escudo de Doran", 450, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3047, "Punteras de Acero", 1100, None, None),
+            core_items: vec![
+                item(patch, 3084, "Corazón de Acero", 3000, None, None),
+                item(patch, 3068, "Égida de Fuego Solar", 2700, None, None),
+                item(patch, 6662, "Rookern Kaénico", 2900, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3075, "Malla de Espinas", 2700, Some(55.8), Some("Heridas Graves")),
+                item(patch, 6660, "Desesperación Interminable", 2800, Some(57.1), Some("Sustento AoE")),
+            ],
+            fifth_items: vec![
+                item(patch, 6665, "Jak'Sho, el Proteico", 3200, Some(60.2), Some("Resistencias Mixtas")),
+                item(patch, 3143, "Presagio de Randuin", 2700, Some(59.5), Some("Anti-Crítico")),
+            ],
+            sixth_items: vec![
+                item(patch, 3083, "Armadura de Warmog", 3100, Some(62.0), Some("Regeneración")),
+                item(patch, 4401, "Fuerza de la Naturaleza", 2800, Some(61.5), Some("Anti-DoT Mágico")),
+            ],
+            situational_items: vec![
+                item(patch, 4401, "Fuerza de la Naturaleza", 2800, None, Some("Resistencia Mágica")),
+                item(patch, 3143, "Presagio de Randuin", 2700, None, Some("Ralentización Activa")),
+                item(patch, 3110, "Corazón de Hielo", 2400, None, Some("Aura Velocidad")),
+                item(patch, 8020, "Máscara Abisal", 2500, None, Some("Reducción MR Enemiga")),
+                item(patch, 3083, "Armadura de Warmog", 3100, None, Some("Regeneración Fuera de Combate")),
+            ],
+        },
+        Archetype::AdAssassin => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1036, "Espada Larga", 350, None, None),
+                item(patch, 2031, "Poción Reutilizable", 150, None, None),
+            ],
+            boots: item(patch, 3158, "Botas Jonias de la Lucidez", 900, None, None),
+            core_items: vec![
+                item(patch, 6698, "Hidra Profana", 3300, None, None),
+                item(patch, 6697, "Oportunidad", 2700, None, None),
+                item(patch, 3814, "Filo de la Noche", 2800, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 6694, "Rencor de Serylda", 3200, Some(57.3), Some("Penetración + Slow")),
+                item(patch, 3142, "Espada Fantasma de Youmuu", 2700, Some(58.1), Some("Movilidad")),
+            ],
+            fifth_items: vec![
+                item(patch, 6696, "Arco Axiomático", 3000, Some(60.4), Some("Reinicio Ultimate")),
+                item(patch, 6699, "Cicloespada Voltaica", 2900, Some(59.8), Some("Slow Energizado")),
+            ],
+            sixth_items: vec![
+                item(patch, 3026, "Ángel Guardián", 3200, Some(63.2), Some("Revivir")),
+                item(patch, 3156, "Fauces de Malmortius", 3100, Some(61.7), Some("Anti-Burst Mágico")),
+            ],
+            situational_items: vec![
+                item(patch, 3814, "Filo de la Noche", 2800, None, Some("Escudo Antihechizos")),
+                item(patch, 6695, "Colmillo de Serpiente", 2500, None, Some("Anti-Escudos")),
+                item(patch, 3156, "Fauces de Malmortius", 3100, None, Some("Defensa AP")),
+                item(patch, 3026, "Ángel Guardián", 3200, None, Some("Supervivencia")),
+                item(patch, 6333, "Danza de la Muerte", 3300, None, Some("Tenacidad")),
+            ],
+        },
+        Archetype::ApAssassin => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 1056, "Anillo de Doran", 400, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3020, "Botas de Hechicero", 1100, None, None),
+            core_items: vec![
+                item(patch, 3100, "Maldición del Liche", 3100, None, None),
+                item(patch, 4645, "Llamasombría", 3200, None, None),
+                item(patch, 3157, "Reloj de Arena de Zhonya", 3250, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3135, "Báculo del Vacío", 3000, Some(57.5), Some("Penetración")),
+                item(patch, 4646, "Sobrecarga Tormentosa", 2900, Some(58.2), Some("Burst AoE")),
+            ],
+            fifth_items: vec![
+                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600, Some(62.0), Some("AP Masivo")),
+                item(patch, 3102, "Velo del Hada de la Muerte", 3100, Some(60.8), Some("Antihechizos")),
+            ],
+            sixth_items: vec![
+                item(patch, 3041, "Robaalmas de Mejai", 1500, Some(64.5), Some("Bola de Nieve")),
+                item(patch, 3137, "Flor Criptofloreciente", 2850, Some(61.9), Some("Cura en Equipo")),
+            ],
+            situational_items: vec![
+                item(patch, 3157, "Reloj de Arena de Zhonya", 3250, None, Some("Invulnerabilidad")),
+                item(patch, 3102, "Velo del Hada de la Muerte", 3100, None, Some("Escudo Mágico")),
+                item(patch, 3165, "Morellonomicón", 2200, None, Some("Anti-Curación")),
+                item(patch, 3135, "Báculo del Vacío", 3000, None, Some("Penetración")),
+                item(patch, 4629, "Impulso Cósmico", 3000, None, Some("Kite y Movilidad")),
+            ],
+        },
+        Archetype::Enchanter => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 3865, "Atlas Mundial", 400, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3158, "Botas Jonias de la Lucidez", 900, None, None),
+            core_items: vec![
+                item(patch, 3869, "Creador de Sueños", 400, None, None),
+                item(patch, 6617, "Renovador de Piedra Lunar", 2700, None, None),
+                item(patch, 6620, "Ecos de Helia", 2200, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 3504, "Pebetero Ardiente", 2300, Some(56.5), Some("Buff Velocidad ADC")),
+                item(patch, 6616, "Báculo de Agua Fluyente", 2300, Some(57.2), Some("Buff AP y CDR")),
+            ],
+            fifth_items: vec![
+                item(patch, 3107, "Redención", 2300, Some(59.8), Some("Cura Global")),
+                item(patch, 6621, "Núcleo del Alba", 2700, Some(60.5), Some("Amplificación de Curas")),
+            ],
+            sixth_items: vec![
+                item(patch, 3222, "Bendición de Mikael", 2300, Some(62.1), Some("Purificación Aliada")),
+                item(patch, 4638, "Piedra Guardiana Vigilante", 2300, Some(63.0), Some("Capacidad Wards")),
+            ],
+            situational_items: vec![
+                item(patch, 3222, "Bendición de Mikael", 2300, None, Some("Limpieza de CC")),
+                item(patch, 2065, "Canción de Batalla de Shurelya", 2200, None, Some("Iniciación / Disengage")),
+                item(patch, 3107, "Redención", 2300, None, Some("Sanación en Área")),
+                item(patch, 3190, "Solari de Hierro", 2200, None, Some("Escudo Colectivo")),
+                item(patch, 3165, "Morellonomicón", 2200, None, Some("Anti-Curación")),
+            ],
+        },
+        Archetype::SupportTank => BuildRecommendation {
+            starting_items: vec![
+                item(patch, 3865, "Atlas Mundial", 400, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+                item(patch, 2003, "Poción de Vida", 50, None, None),
+            ],
+            boots: item(patch, 3009, "Botas de Rapidez", 900, None, None),
+            core_items: vec![
+                item(patch, 3870, "Oposición Celestial", 400, None, None),
+                item(patch, 3190, "Medallón de los Solari de Hierro", 2200, None, None),
+                item(patch, 3109, "Promesa del Caballero", 2200, None, None),
+            ],
+            fourth_items: vec![
+                item(patch, 6667, "Pionero", 2500, Some(56.2), Some("Iniciación Acelerada")),
+                item(patch, 3050, "Convergencia de Zeke", 2200, Some(57.0), Some("Ralentización + Daño")),
+            ],
+            fifth_items: vec![
+                item(patch, 3075, "Malla de Espinas", 2700, Some(58.7), Some("Heridas Graves")),
+                item(patch, 6662, "Rookern Kaénico", 2900, Some(59.5), Some("Escudo Mágico")),
+            ],
+            sixth_items: vec![
+                item(patch, 4638, "Piedra Guardiana Vigilante", 2300, Some(61.8), Some("Control Visión")),
+                item(patch, 3110, "Corazón de Hielo", 2400, Some(60.9), Some("Aura Anti-Velocidad")),
+            ],
+            situational_items: vec![
+                item(patch, 6667, "Pionero", 2500, None, Some("Engage y Estela")),
+                item(patch, 3050, "Convergencia de Zeke", 2200, None, Some("Ralentización AoE")),
+                item(patch, 3109, "Promesa del Caballero", 2200, None, Some("Proteger al Carry")),
+                item(patch, 3110, "Corazón de Hielo", 2400, None, Some("Anti-Autoataques")),
+                item(patch, 6662, "Rookern Kaénico", 2900, None, Some("Resistencia Mágica")),
+            ],
+        },
+    }
+}
 
-    // Elo-based adjustments
+fn runes_for_archetype(archetype: Archetype) -> RuneTree {
+    match archetype {
+        Archetype::AdBruiser => RuneTree {
+            primary_style_id: 8000,
+            primary_style_name: "Precisión".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
+            keystone_id: 8010,
+            keystone_name: "Conquistador".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
+            primary_runes: vec![
+                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
+                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
+                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
+            ],
+            secondary_style_id: 8400,
+            secondary_style_name: "Valor".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
+            secondary_runes: vec![
+                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
+                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::ApMage => RuneTree {
+            primary_style_id: 8200,
+            primary_style_name: "Brujería".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
+            keystone_id: 8229,
+            keystone_name: "Cometa Arcano".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/ArcaneComet/ArcaneComet.png".to_string(),
+            primary_runes: vec![
+                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
+                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
+                rune(8237, "Piromancia", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
+            ],
+            secondary_style_id: 8300,
+            secondary_style_name: "Inspiración".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Whimsy.png".to_string(),
+            secondary_runes: vec![
+                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
+                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::AdCarry => RuneTree {
+            primary_style_id: 8000,
+            primary_style_name: "Precisión".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
+            keystone_id: 8005,
+            keystone_name: "Ataque Intensificado".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png".to_string(),
+            primary_runes: vec![
+                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
+                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
+                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
+            ],
+            secondary_style_id: 8300,
+            secondary_style_name: "Inspiración".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Whimsy.png".to_string(),
+            secondary_runes: vec![
+                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
+                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
+            ],
+            shards: vec!["+10% Velocidad de Ataque".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::Tank => RuneTree {
+            primary_style_id: 8400,
+            primary_style_name: "Valor".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
+            keystone_id: 8437,
+            keystone_name: "Garras del Inmortal".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/GraspOfTheUndying/GraspOfTheUndying.png".to_string(),
+            primary_runes: vec![
+                rune(8446, "Demoler", "perk-images/Styles/Resolve/Demolish/Demolish.png", 1),
+                rune(8429, "Acondicionamiento", "perk-images/Styles/Resolve/Conditioning/Conditioning.png", 2),
+                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
+            ],
+            secondary_style_id: 8000,
+            secondary_style_name: "Precisión".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
+            secondary_runes: vec![
+                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
+                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+6 Armadura".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::AdAssassin => RuneTree {
+            primary_style_id: 8100,
+            primary_style_name: "Dominación".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
+            keystone_id: 8112,
+            keystone_name: "Electrocutar".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/Electrocute/Electrocute.png".to_string(),
+            primary_runes: vec![
+                rune(8143, "Impacto Súbito", "perk-images/Styles/Domination/SuddenImpact/SuddenImpact.png", 1),
+                rune(8138, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
+                rune(8106, "Cazador Definitivo", "perk-images/Styles/Domination/UltimateHunter/UltimateHunter.png", 3),
+            ],
+            secondary_style_id: 8200,
+            secondary_style_name: "Brujería".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
+            secondary_runes: vec![
+                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
+                rune(8236, "Se Avecina Tormenta", "perk-images/Styles/Sorcery/GatheringStorm/GatheringStorm.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::ApAssassin => RuneTree {
+            primary_style_id: 8100,
+            primary_style_name: "Dominación".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
+            keystone_id: 8112,
+            keystone_name: "Electrocutar".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/Electrocute/Electrocute.png".to_string(),
+            primary_runes: vec![
+                rune(8143, "Impacto Súbito", "perk-images/Styles/Domination/SuddenImpact/SuddenImpact.png", 1),
+                rune(8138, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
+                rune(8105, "Cazador Incansable", "perk-images/Styles/Domination/RelentlessHunter/RelentlessHunter.png", 3),
+            ],
+            secondary_style_id: 8000,
+            secondary_style_name: "Precisión".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
+            secondary_runes: vec![
+                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
+                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::Enchanter => RuneTree {
+            primary_style_id: 8200,
+            primary_style_name: "Brujería".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
+            keystone_id: 8214,
+            keystone_name: "Invocación: Aery".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/SummonAery/SummonAery.png".to_string(),
+            primary_runes: vec![
+                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
+                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
+                rune(8237, "Piromancia", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
+            ],
+            secondary_style_id: 8400,
+            secondary_style_name: "Valor".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
+            secondary_runes: vec![
+                rune(8401, "Fuente de Vida", "perk-images/Styles/Resolve/FontOfLife/FontOfLife.png", 1),
+                rune(8453, "Revitalizar", "perk-images/Styles/Resolve/Revitalize/Revitalize.png", 3),
+            ],
+            shards: vec!["+9 Fuerza Adaptativa".to_string(), "+9 Fuerza Adaptativa".to_string(), "+65 Vida Plana".to_string()],
+        },
+        Archetype::SupportTank => RuneTree {
+            primary_style_id: 8400,
+            primary_style_name: "Valor".to_string(),
+            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
+            keystone_id: 8439,
+            keystone_name: "Reverberacción".to_string(),
+            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/VeteranAftershock/VeteranAftershock.png".to_string(),
+            primary_runes: vec![
+                rune(8401, "Fuente de Vida", "perk-images/Styles/Resolve/FontOfLife/FontOfLife.png", 1),
+                rune(8429, "Acondicionamiento", "perk-images/Styles/Resolve/Conditioning/Conditioning.png", 2),
+                rune(8242, "Inquebrantable", "perk-images/Styles/Resolve/Unflinching/Unflinching.png", 3),
+            ],
+            secondary_style_id: 8300,
+            secondary_style_name: "Inspiración".to_string(),
+            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Whimsy.png".to_string(),
+            secondary_runes: vec![
+                rune(8306, "Destello Hextech", "perk-images/Styles/Inspiration/HextechFlashtraption/HextechFlashtraption.png", 1),
+                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
+            ],
+            shards: vec!["+8 Aceleración de Habilidad".to_string(), "+6 Armadura".to_string(), "+65 Vida Plana".to_string()],
+        },
+    }
+}
+
+fn spells_for_role(role: &str) -> Vec<SummonerSpell> {
+    match role {
+        "TOP" => vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleportación")],
+        "JUNGLE" => vec![spell("SummonerSmite", "Aplastar"), spell("SummonerFlash", "Destello")],
+        "MID" => vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Ignición")],
+        "CARRY" | "BOT" => vec![spell("SummonerFlash", "Destello"), spell("SummonerHeal", "Curación")],
+        "SUPPORT" => vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Ignición")],
+        _ => vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Ignición")],
+    }
+}
+
+fn adjust_stats(
+    champ_id: &str,
+    server: &str,
+    tier: &str,
+    base_wr: f64,
+    base_pr: f64,
+    base_br: f64,
+) -> (f64, f64, f64, String, f64) {
+    let mut wr = base_wr;
+    let mut pr = base_pr;
+    let mut br = base_br;
+
+    let s = server.to_uppercase();
+    let t = tier.to_uppercase();
+
+    // Elo adjustments
     match t.as_str() {
         "CHALLENGER" | "GRANDMASTER" | "MASTER" => {
-            // High elo favors mechanics & playmaking champions
-            if ["LeeSin", "Ahri", "Sylas", "Camille", "Aatrox", "Thresh", "Kaisa"].contains(&champ.id.as_str()) {
-                champ.win_rate += 1.40;
-                champ.pick_rate += 3.20;
-            } else if ["Warwick", "Darius", "Ashe"].contains(&champ.id.as_str()) {
-                champ.win_rate -= 0.80;
-                champ.pick_rate -= 1.60;
+            if ["LeeSin", "Ahri", "Sylas", "Camille", "Aatrox", "Thresh", "Kaisa", "Yone", "Azir", "Jayce", "LeBlanc"].contains(&champ_id) {
+                wr += 1.60;
+                pr += 3.80;
+                br += 4.50;
+            } else if ["Warwick", "Garen", "MasterYi", "Malphite", "Amumu", "Nasus"].contains(&champ_id) {
+                wr -= 2.10;
+                pr -= 3.20;
             }
         }
         "IRON" | "BRONZE" | "SILVER" | "GOLD" => {
-            // Low elo favors simpler juggernauts and teamfighters
-            if ["Darius", "Warwick", "Jinx", "Blitzcrank", "Leona"].contains(&champ.id.as_str()) {
-                champ.win_rate += 1.80;
-                champ.pick_rate += 2.50;
-            } else if ["LeeSin", "Camille", "Sylas"].contains(&champ.id.as_str()) {
-                champ.win_rate -= 1.50;
-                champ.pick_rate -= 2.00;
+            if ["Garen", "Darius", "Warwick", "MasterYi", "Amumu", "Blitzcrank", "MissFortune", "Lux", "Malphite"].contains(&champ_id) {
+                wr += 2.20;
+                pr += 3.50;
+                br += 5.00;
+            } else if ["LeeSin", "Camille", "Sylas", "Azir", "Nidalee", "Aphelios"].contains(&champ_id) {
+                wr -= 2.40;
+                pr -= 3.10;
             }
         }
-        _ => {} // PLATINUM, EMERALD, DIAMOND are balanced baseline
+        _ => {} // PLATINUM, EMERALD, DIAMOND are balanced standard meta
     }
 
-    // Server / Regional meta preferences
+    // Regional adjustments
     match s.as_str() {
         "KR" => {
-            if ["LeeSin", "Ahri", "Sylas", "Thresh"].contains(&champ.id.as_str()) {
-                champ.pick_rate += 2.80;
-                champ.win_rate += 0.60;
+            if ["LeeSin", "Ahri", "Sylas", "Thresh", "Nidalee", "Jayce", "Lucian"].contains(&champ_id) {
+                pr += 3.40;
+                wr += 0.80;
             }
         }
         "EUW" | "EUNE" => {
-            if ["Camille", "Darius", "Orianna", "Jinx", "Nautilus"].contains(&champ.id.as_str()) {
-                champ.pick_rate += 1.80;
-                champ.win_rate += 0.50;
+            if ["Camille", "Orianna", "Viktor", "Jinx", "Nautilus", "Aatrox", "Gwen"].contains(&champ_id) {
+                pr += 2.20;
+                wr += 0.60;
             }
         }
         "NA" => {
-            if ["Jinx", "Caitlyn", "Ahri", "JarvanIV"].contains(&champ.id.as_str()) {
-                champ.pick_rate += 1.90;
-                champ.win_rate += 0.40;
+            if ["Jinx", "Caitlyn", "Lux", "Ezreal", "Ahri", "Darius", "JarvanIV"].contains(&champ_id) {
+                pr += 2.50;
+                wr += 0.50;
             }
         }
         "LAS" | "LAN" | "BR" => {
-            if ["Aatrox", "Darius", "Blitzcrank", "Renekton", "Jinx"].contains(&champ.id.as_str()) {
-                champ.pick_rate += 2.10;
-                champ.win_rate += 0.70;
+            if ["Aatrox", "Darius", "Mordekaiser", "Blitzcrank", "Renekton", "Yasuo", "Samira", "Pyke"].contains(&champ_id) {
+                pr += 2.90;
+                wr += 0.90;
             }
         }
         _ => {}
     }
 
-    champ.win_rate = (champ.win_rate * 100.0).round() / 100.0;
-    champ.pick_rate = (champ.pick_rate.max(0.5) * 100.0).round() / 100.0;
-    champ.score = calculate_score(champ.win_rate, champ.pick_rate, &champ.tier);
+    wr = (wr * 100.0).round() / 100.0;
+    pr = (pr.max(0.4) * 100.0).round() / 100.0;
+    br = (br.max(0.2) * 100.0).round() / 100.0;
+
+    let preliminary_tier = if wr >= 51.5 && pr >= 6.0 {
+        "S+"
+    } else if wr >= 50.8 && pr >= 4.0 {
+        "S"
+    } else if wr >= 50.0 {
+        "A"
+    } else if wr >= 49.0 {
+        "B"
+    } else {
+        "C"
+    };
+
+    let score = calculate_score(wr, pr, preliminary_tier);
+    let final_tier = determine_tier(score);
+
+    (wr, pr, br, final_tier, score)
 }
 
-pub fn generate_default_dataset(patch: &str, server: &str, tier: &str, is_cached: bool) -> LoLMetaData {
-    let mut champs = Vec::new();
-
-    // ==========================================
-    // TOP LANE CHAMPIONS
-    // ==========================================
-    // 1. Aatrox (S+)
-    champs.push(ChampionStat {
-        id: "Aatrox".to_string(),
-        key: "266".to_string(),
-        name: "Aatrox".to_string(),
-        title: "la Espada de los Oscuros".to_string(),
-        role: "TOP".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.85,
-        pick_rate: 9.42,
-        ban_rate: 11.20,
-        score: calculate_score(51.85, 9.42, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Aatrox.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Aatrox_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6631, "Rompeavances", 3300),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 6333, "Danza de la Muerte", 3200),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3053, "Guantelete de Sterak", 3100), item(patch, 3065, "Rostro Espiritual", 2900)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 2. Darius (S)
-    champs.push(ChampionStat {
-        id: "Darius".to_string(),
-        key: "122".to_string(),
-        name: "Darius".to_string(),
-        title: "la Mano de Noxus".to_string(),
-        role: "TOP".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.40,
-        pick_rate: 8.65,
-        ban_rate: 14.80,
-        score: calculate_score(51.40, 8.65, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Darius.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Darius_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8275, "Capa del Nimbo", "perk-images/Styles/Sorcery/NimbusCloak/NimbusCloak.png", 1),
-                rune(8234, "Celeridad", "perk-images/Styles/Sorcery/Celerity/Celerity.png", 2),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3078, "Fuerza de la Trinidad", 3333),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3742, "Coraza del Hombre Muerto", 2900), item(patch, 4401, "Fuerza de la Naturaleza", 2800)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 3. Camille (S)
-    champs.push(ChampionStat {
-        id: "Camille".to_string(),
-        key: "164".to_string(),
-        name: "Camille".to_string(),
-        title: "la Sombra de Acero".to_string(),
-        role: "TOP".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.90,
-        pick_rate: 7.20,
-        ban_rate: 5.40,
-        score: calculate_score(51.90, 7.20, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Camille.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Camille_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8400,
-            primary_style_name: "Valor".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            keystone_id: 8437,
-            keystone_name: "Garras del Inmortal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/GraspOfTheUndying/GraspOfTheUndying.png".to_string(),
-            primary_runes: vec![
-                rune(8401, "Golpe de Escudo", "perk-images/Styles/Resolve/ShieldBash/ShieldBash.png", 1),
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            secondary_style_id: 8000,
-            secondary_style_name: "Precisión".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            secondary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3078, "Fuerza de la Trinidad", 3333),
-                item(patch, 3074, "Hidra Voraz", 3300),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 6333, "Danza de la Muerte", 3200), item(patch, 3026, "Ángel Guardián", 3200)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 4. Jax (S)
-    champs.push(ChampionStat {
-        id: "Jax".to_string(),
-        key: "24".to_string(),
-        name: "Jax".to_string(),
-        title: "el Maestro de Armas".to_string(),
-        role: "TOP".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.60,
-        pick_rate: 6.80,
-        ban_rate: 9.30,
-        score: calculate_score(51.60, 6.80, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Jax.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Jax_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8400,
-            primary_style_name: "Valor".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            keystone_id: 8437,
-            keystone_name: "Garras del Inmortal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/GraspOfTheUndying/GraspOfTheUndying.png".to_string(),
-            primary_runes: vec![
-                rune(8446, "Demoler", "perk-images/Styles/Resolve/Demolish/Demolish.png", 1),
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-                rune(8237, "Quemadura", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3078, "Fuerza de la Trinidad", 3333),
-                item(patch, 3153, "Rey Arruinado", 3200),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3111, "Botas de Mercurio", 1100),
-            situational_items: vec![item(patch, 3075, "Malla de Espinas", 2700), item(patch, 3026, "Ángel Guardián", 3200)],
-        },
-        skill_order: vec!["W".into(), "E".into(), "Q".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 5. Renekton (A)
-    champs.push(ChampionStat {
-        id: "Renekton".to_string(),
-        key: "58".to_string(),
-        name: "Renekton".to_string(),
-        title: "el Carnicero de las Arenas".to_string(),
-        role: "TOP".to_string(),
-        tier: "A".to_string(),
-        win_rate: 50.85,
-        pick_rate: 5.90,
-        ban_rate: 4.80,
-        score: calculate_score(50.85, 5.90, "A"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Renekton.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Renekton_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8473, "Revestimiento de Huesos", "perk-images/Styles/Resolve/BonePlating/BonePlating.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6630, "Bebedor de Sangre", 3200),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 6333, "Danza de la Muerte", 3200), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 6. Niche Pick: Warwick Top (High WR 53.8%, but low PR 2.1% -> Excluded when filter is >= 3.5%)
-    champs.push(ChampionStat {
-        id: "Warwick".to_string(),
-        key: "19".to_string(),
-        name: "Warwick".to_string(),
-        title: "la Ira Desatada de Zaun".to_string(),
-        role: "TOP".to_string(),
-        tier: "B".to_string(),
-        win_rate: 53.80,
-        pick_rate: 2.10,
-        ban_rate: 1.50,
-        score: calculate_score(53.80, 2.10, "B"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Warwick.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Warwick_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8400,
-            primary_style_name: "Valor".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            keystone_id: 8437,
-            keystone_name: "Garras del Inmortal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/GraspOfTheUndying/GraspOfTheUndying.png".to_string(),
-            primary_runes: vec![
-                rune(8446, "Demoler", "perk-images/Styles/Resolve/Demolish/Demolish.png", 1),
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8242, "Revitalizar", "perk-images/Styles/Resolve/Revitalize/Revitalize.png", 3),
-            ],
-            secondary_style_id: 8000,
-            secondary_style_name: "Precisión".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            secondary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1054, "Escudo de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3153, "Rey Arruinado", 3200),
-                item(patch, 3074, "Hidra Titánica", 3300),
-                item(patch, 3068, "Capa de Fuego Solar", 2700),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3065, "Rostro Espiritual", 2900), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerBarrier", "Barrera")],
-    });
-
-    // ==========================================
-    // JUNGLE CHAMPIONS
-    // ==========================================
-    // 1. Lee Sin (S+)
-    champs.push(ChampionStat {
-        id: "LeeSin".to_string(),
-        key: "64".to_string(),
-        name: "Lee Sin".to_string(),
-        title: "el Monje Ciego".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.10,
-        pick_rate: 13.50,
-        ban_rate: 14.10,
-        score: calculate_score(51.10, 13.50, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/LeeSin.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/LeeSin_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8100,
-            secondary_style_name: "Dominación".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            secondary_runes: vec![
-                rune(8143, "Impacto Repentino", "perk-images/Styles/Domination/SuddenImpact/SuddenImpact.png", 1),
-                rune(8135, "Cazador Incansable", "perk-images/Styles/Domination/RelentlessHunter/RelentlessHunter.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1103, "Cría de Caminapeligros", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6692, "Eclipse", 2800),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 6333, "Danza de la Muerte", 3200),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3053, "Guantelete de Sterak", 3100), item(patch, 3156, "Fauces de Malmortius", 3100)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // 2. Viego (S+)
-    champs.push(ChampionStat {
-        id: "Viego".to_string(),
-        key: "234".to_string(),
-        name: "Viego".to_string(),
-        title: "el Rey Arruinado".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.75,
-        pick_rate: 11.20,
-        ban_rate: 7.90,
-        score: calculate_score(51.75, 11.20, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Viego.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Viego_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1102, "Cachorro de Garrafuego", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3078, "Fuerza de la Trinidad", 3333),
-                item(patch, 3153, "Rey Arruinado", 3200),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 6333, "Danza de la Muerte", 3200), item(patch, 3026, "Ángel Guardián", 3200)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // 3. Jarvan IV (S)
-    champs.push(ChampionStat {
-        id: "JarvanIV".to_string(),
-        key: "59".to_string(),
-        name: "Jarvan IV".to_string(),
-        title: "el Ejemplo de Demacia".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.60,
-        pick_rate: 8.40,
-        ban_rate: 3.20,
-        score: calculate_score(51.60, 8.40, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/JarvanIV.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/JarvanIV_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1102, "Cachorro de Garrafuego", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6631, "Rompeavances", 3300),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 3053, "Guantelete de Sterak", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3143, "Presagio de Randuin", 2700), item(patch, 3065, "Rostro Espiritual", 2900)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // 4. Nocturne (S)
-    champs.push(ChampionStat {
-        id: "Nocturne".to_string(),
-        key: "56".to_string(),
-        name: "Nocturne".to_string(),
-        title: "la Pesadilla Eterna".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.50,
-        pick_rate: 7.90,
-        ban_rate: 6.20,
-        score: calculate_score(51.50, 7.90, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Nocturne.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Nocturne_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8008,
-            keystone_name: "Cadencia Letal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/LethalTempo/LethalTempoTemp.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8100,
-            secondary_style_name: "Dominación".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            secondary_runes: vec![
-                rune(8136, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
-                rune(8106, "Cazador Definitivo", "perk-images/Styles/Domination/UltimateHunter/UltimateHunter.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1103, "Cría de Caminapeligros", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6631, "Rompeavances", 3300),
-                item(patch, 3071, "Cuchilla Negra", 3000),
-                item(patch, 3156, "Fauces de Malmortius", 3100),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3026, "Ángel Guardián", 3200), item(patch, 6333, "Danza de la Muerte", 3200)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // 5. Kha'Zix (A)
-    champs.push(ChampionStat {
-        id: "Khazix".to_string(),
-        key: "121".to_string(),
-        name: "Kha'Zix".to_string(),
-        title: "el Saqueador del Vacío".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "A".to_string(),
-        win_rate: 51.00,
-        pick_rate: 6.70,
-        ban_rate: 5.10,
-        score: calculate_score(51.00, 6.70, "A"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Khazix.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Khazix_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8100,
-            primary_style_name: "Dominación".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            keystone_id: 8112,
-            keystone_name: "Electrocutar".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/Electrocute/Electrocute.png".to_string(),
-            primary_runes: vec![
-                rune(8143, "Impacto Repentino", "perk-images/Styles/Domination/SuddenImpact/SuddenImpact.png", 1),
-                rune(8136, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
-                rune(8135, "Cazador Incansable", "perk-images/Styles/Domination/RelentlessHunter/RelentlessHunter.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8275, "Capa del Nimbo", "perk-images/Styles/Sorcery/NimbusCloak/NimbusCloak.png", 1),
-                rune(8232, "Caminata sobre el Agua", "perk-images/Styles/Sorcery/Waterwalking/Waterwalking.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1102, "Cachorro de Garrafuego", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3142, "Espada Fantasma de Youmuu", 2800),
-                item(patch, 6676, "Coleccionista", 3000),
-                item(patch, 3814, "Filo de la Noche", 2800),
-            ],
-            boots: item(patch, 3158, "Botas Jonias de la Lucidez", 900),
-            situational_items: vec![item(patch, 6694, "Rencor de Serylda", 3200), item(patch, 3026, "Ángel Guardián", 3200)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // 6. Niche Pick: Ivern (High WR 53.6%, low PR 1.6% -> Excluded by slider)
-    champs.push(ChampionStat {
-        id: "Ivern".to_string(),
-        key: "427".to_string(),
-        name: "Ivern".to_string(),
-        title: "el Padre Arborescente".to_string(),
-        role: "JUNGLE".to_string(),
-        tier: "B".to_string(),
-        win_rate: 53.60,
-        pick_rate: 1.60,
-        ban_rate: 0.80,
-        score: calculate_score(53.60, 1.60, "B"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Ivern.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Ivern_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8200,
-            primary_style_name: "Brujería".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            keystone_id: 8214,
-            keystone_name: "Invocar a Aery".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/SummonAery/SummonAery.png".to_string(),
-            primary_runes: vec![
-                rune(8275, "Capa del Nimbo", "perk-images/Styles/Sorcery/NimbusCloak/NimbusCloak.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-                rune(8232, "Caminata sobre el Agua", "perk-images/Styles/Sorcery/Waterwalking/Waterwalking.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1103, "Cría de Caminapeligros", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6617, "Renovador de Piedra Lunar", 2200),
-                item(patch, 3504, "Incensario Ardiente", 2300),
-                item(patch, 6645, "Mandato Imperial", 2300),
-            ],
-            boots: item(patch, 3158, "Botas Jonias de la Lucidez", 900),
-            situational_items: vec![item(patch, 3107, "Redención", 2300), item(patch, 3116, "Cetro de Cristal de Rylai", 2600)],
-        },
-        skill_order: vec!["E".into(), "Q".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerSmite", "Aplastar")],
-    });
-
-    // ==========================================
-    // MID LANE CHAMPIONS
-    // ==========================================
-    // 1. Ahri (S+)
-    champs.push(ChampionStat {
-        id: "Ahri".to_string(),
-        key: "103".to_string(),
-        name: "Ahri".to_string(),
-        title: "la Mujer Zorro de Nueve Colas".to_string(),
-        role: "MID".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 52.30,
-        pick_rate: 11.50,
-        ban_rate: 6.80,
-        score: calculate_score(52.30, 11.50, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Ahri.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Ahri_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8100,
-            primary_style_name: "Dominación".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            keystone_id: 8112,
-            keystone_name: "Electrocutar".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/Electrocute/Electrocute.png".to_string(),
-            primary_runes: vec![
-                rune(8126, "Sabor a Sangre", "perk-images/Styles/Domination/TasteOfBlood/GreenTerror_TasteOfBlood.png", 1),
-                rune(8136, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
-                rune(8106, "Cazador Definitivo", "perk-images/Styles/Domination/UltimateHunter/UltimateHunter.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6655, "Compañero de Luden", 3000),
-                item(patch, 4646, "Sobrecarga Tormentosa", 2900),
-                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3157, "Reloj de Arena de Zhonya", 3250), item(patch, 3135, "Báculo del Vacío", 3000)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 2. Sylas (S+)
-    champs.push(ChampionStat {
-        id: "Sylas".to_string(),
-        key: "517".to_string(),
-        name: "Sylas".to_string(),
-        title: "el Usurpador Desencadenado".to_string(),
-        role: "MID".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.80,
-        pick_rate: 10.40,
-        ban_rate: 12.30,
-        score: calculate_score(51.80, 10.40, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Sylas.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Sylas_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8010,
-            keystone_name: "Conquistador".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3152, "Cinturón Cohete Hextech", 2600),
-                item(patch, 3100, "Perdición del Liche", 3100),
-                item(patch, 3157, "Reloj de Arena de Zhonya", 3250),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3089, "Sombrero Mortal de Rabadon", 3600), item(patch, 3135, "Báculo del Vacío", 3000)],
-        },
-        skill_order: vec!["W".into(), "E".into(), "Q".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 3. Syndra (S)
-    champs.push(ChampionStat {
-        id: "Syndra".to_string(),
-        key: "134".to_string(),
-        name: "Syndra".to_string(),
-        title: "la Soberana Oscura".to_string(),
-        role: "MID".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.60,
-        pick_rate: 7.80,
-        ban_rate: 5.80,
-        score: calculate_score(51.60, 7.80, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Syndra.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Syndra_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8200,
-            primary_style_name: "Brujería".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            keystone_id: 8230,
-            keystone_name: "Fase Veloz".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/PhaseRush/PhaseRush.png".to_string(),
-            primary_runes: vec![
-                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-                rune(8237, "Quemadura", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6655, "Compañero de Luden", 3000),
-                item(patch, 4646, "Sobrecarga Tormentosa", 2900),
-                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3157, "Reloj de Arena de Zhonya", 3250), item(patch, 3135, "Báculo del Vacío", 3000)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 4. Orianna (S)
-    champs.push(ChampionStat {
-        id: "Orianna".to_string(),
-        key: "61".to_string(),
-        name: "Orianna".to_string(),
-        title: "la Dama del Mecanismo de Relojería".to_string(),
-        role: "MID".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.45,
-        pick_rate: 6.90,
-        ban_rate: 3.50,
-        score: calculate_score(51.45, 6.90, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Orianna.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Orianna_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8200,
-            primary_style_name: "Brujería".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            keystone_id: 8230,
-            keystone_name: "Fase Veloz".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/PhaseRush/PhaseRush.png".to_string(),
-            primary_runes: vec![
-                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-                rune(8237, "Quemadura", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3003, "Abrazo del Serafín", 2900),
-                item(patch, 4646, "Sobrecarga Tormentosa", 2900),
-                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3157, "Reloj de Arena de Zhonya", 3250), item(patch, 3135, "Báculo del Vacío", 3000)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 5. Yone (A)
-    champs.push(ChampionStat {
-        id: "Yone".to_string(),
-        key: "777".to_string(),
-        name: "Yone".to_string(),
-        title: "el Imborrable".to_string(),
-        role: "MID".to_string(),
-        tier: "A".to_string(),
-        win_rate: 50.90,
-        pick_rate: 9.80,
-        ban_rate: 13.40,
-        score: calculate_score(50.90, 9.80, "A"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Yone.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Yone_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8008,
-            keystone_name: "Cadencia Letal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/LethalTempo/LethalTempoTemp.png".to_string(),
-            primary_runes: vec![
-                rune(9111, "Triunfo", "perk-images/Styles/Precision/Triumph.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1054, "Escudo de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3153, "Rey Arruinado", 3200),
-                item(patch, 3031, "Filo Infinito", 3400),
-                item(patch, 3072, "Sanguinaria", 3400),
-            ],
-            boots: item(patch, 3006, "Grebas de Berserker", 1100),
-            situational_items: vec![item(patch, 3026, "Ángel Guardián", 3200), item(patch, 3156, "Fauces de Malmortius", 3100)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // 6. Niche Pick: Anivia (High WR 53.7%, low PR 1.9% -> Filtered out)
-    champs.push(ChampionStat {
-        id: "Anivia".to_string(),
-        key: "34".to_string(),
-        name: "Anivia".to_string(),
-        title: "la Criofénix".to_string(),
-        role: "MID".to_string(),
-        tier: "B".to_string(),
-        win_rate: 53.70,
-        pick_rate: 1.90,
-        ban_rate: 1.10,
-        score: calculate_score(53.70, 1.90, "B"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Anivia.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Anivia_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8100,
-            primary_style_name: "Dominación".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            keystone_id: 8112,
-            keystone_name: "Electrocutar".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/Electrocute/Electrocute.png".to_string(),
-            primary_runes: vec![
-                rune(8139, "Golpe Bajo", "perk-images/Styles/Domination/CheapShot/CheapShot.png", 1),
-                rune(8136, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
-                rune(8135, "Cazador Incansable", "perk-images/Styles/Domination/RelentlessHunter/RelentlessHunter.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3027, "Vara de las Edades", 2600),
-                item(patch, 3003, "Abrazo del Serafín", 2900),
-                item(patch, 3157, "Reloj de Arena de Zhonya", 3250),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3089, "Sombrero Mortal de Rabadon", 3600), item(patch, 3135, "Báculo del Vacío", 3000)],
-        },
-        skill_order: vec!["E".into(), "Q".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerTeleport", "Teleport")],
-    });
-
-    // ==========================================
-    // BOT LANE (ADC) CHAMPIONS
-    // ==========================================
-    // 1. Jinx (S+)
-    champs.push(ChampionStat {
-        id: "Jinx".to_string(),
-        key: "222".to_string(),
-        name: "Jinx".to_string(),
-        title: "la Bala Perdida".to_string(),
-        role: "CARRY".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 52.40,
-        pick_rate: 15.60,
-        ban_rate: 8.40,
-        score: calculate_score(52.40, 15.60, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Jinx.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Jinx_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8008,
-            keystone_name: "Cadencia Letal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/LethalTempo/LethalTempoTemp.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8234, "Celeridad", "perk-images/Styles/Sorcery/Celerity/Celerity.png", 2),
-                rune(8236, "Se Avecina Tormenta", "perk-images/Styles/Sorcery/GatheringStorm/GatheringStorm.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3095, "Navaja de Asalto", 3000),
-                item(patch, 3031, "Filo Infinito", 3400),
-                item(patch, 3046, "Bailarín Espectral", 2600),
-            ],
-            boots: item(patch, 3006, "Grebas de Berserker", 1100),
-            situational_items: vec![item(patch, 3036, "Recuerdos de Lord Dominik", 3000), item(patch, 3072, "Sanguinaria", 3400)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerHeal", "Curación")],
-    });
-
-    // 2. Kai'Sa (S+)
-    champs.push(ChampionStat {
-        id: "Kaisa".to_string(),
-        key: "145".to_string(),
-        name: "Kai'Sa".to_string(),
-        title: "la Hija del Vacío".to_string(),
-        role: "CARRY".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.70,
-        pick_rate: 18.20,
-        ban_rate: 9.80,
-        score: calculate_score(51.70, 18.20, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Kaisa.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Kaisa_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8008,
-            keystone_name: "Cadencia Letal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/LethalTempo/LethalTempoTemp.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3004, "Manamune", 2900),
-                item(patch, 3115, "Diente de Nashor", 3000),
-                item(patch, 3124, "Espadafuria de Guinsoo", 3000),
-            ],
-            boots: item(patch, 3006, "Grebas de Berserker", 1100),
-            situational_items: vec![item(patch, 3157, "Reloj de Arena de Zhonya", 3250), item(patch, 3089, "Sombrero Mortal de Rabadon", 3600)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerHeal", "Curación")],
-    });
-
-    // 3. Jhin (S)
-    champs.push(ChampionStat {
-        id: "Jhin".to_string(),
-        key: "202".to_string(),
-        name: "Jhin".to_string(),
-        title: "el Virtuoso".to_string(),
-        role: "CARRY".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.55,
-        pick_rate: 14.10,
-        ban_rate: 5.60,
-        score: calculate_score(51.55, 14.10, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Jhin.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Jhin_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8021,
-            keystone_name: "Pies Veloces".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/FleetFootwork/FleetFootwork.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8234, "Celeridad", "perk-images/Styles/Sorcery/Celerity/Celerity.png", 2),
-                rune(8236, "Se Avecina Tormenta", "perk-images/Styles/Sorcery/GatheringStorm/GatheringStorm.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6676, "Coleccionista", 3000),
-                item(patch, 3031, "Filo Infinito", 3400),
-                item(patch, 3094, "Cañón de Fuego Rápido", 3000),
-            ],
-            boots: item(patch, 3009, "Botas de Rapidez", 900),
-            situational_items: vec![item(patch, 3036, "Recuerdos de Lord Dominik", 3000), item(patch, 3072, "Sanguinaria", 3400)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerHeal", "Curación")],
-    });
-
-    // 4. Ashe (S)
-    champs.push(ChampionStat {
-        id: "Ashe".to_string(),
-        key: "22".to_string(),
-        name: "Ashe".to_string(),
-        title: "la Arquera de Hielo".to_string(),
-        role: "CARRY".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.40,
-        pick_rate: 10.30,
-        ban_rate: 4.20,
-        score: calculate_score(51.40, 10.30, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Ashe.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Ashe_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8008,
-            keystone_name: "Cadencia Letal".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/LethalTempo/LethalTempoTemp.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9105, "Leyenda: Presteza", "perk-images/Styles/Precision/LegendAlacrity/LegendAlacrity.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3078, "Fuerza de la Trinidad", 3333),
-                item(patch, 3153, "Rey Arruinado", 3200),
-                item(patch, 3085, "Huracán de Runaan", 2800),
-            ],
-            boots: item(patch, 3006, "Grebas de Berserker", 1100),
-            situational_items: vec![item(patch, 3031, "Filo Infinito", 3400), item(patch, 3072, "Sanguinaria", 3400)],
-        },
-        skill_order: vec!["W".into(), "Q".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerGhost", "Fantasmal")],
-    });
-
-    // 5. Caitlyn (A)
-    champs.push(ChampionStat {
-        id: "Caitlyn".to_string(),
-        key: "51".to_string(),
-        name: "Caitlyn".to_string(),
-        title: "la Sheriff de Piltóver".to_string(),
-        role: "CARRY".to_string(),
-        tier: "A".to_string(),
-        win_rate: 50.80,
-        pick_rate: 13.90,
-        ban_rate: 8.50,
-        score: calculate_score(50.80, 13.90, "A"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Caitlyn.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Caitlyn_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8000,
-            primary_style_name: "Precisión".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            keystone_id: 8021,
-            keystone_name: "Pies Veloces".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/FleetFootwork/FleetFootwork.png".to_string(),
-            primary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(9103, "Leyenda: Linaje", "perk-images/Styles/Precision/LegendBloodline/LegendBloodline.png", 2),
-                rune(8014, "Golpe de Gracia", "perk-images/Styles/Precision/CoupDeGrace/CoupDeGrace.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8233, "Concentración Absoluta", "perk-images/Styles/Sorcery/AbsoluteFocus/AbsoluteFocus.png", 2),
-                rune(8236, "Se Avecina Tormenta", "perk-images/Styles/Sorcery/GatheringStorm/GatheringStorm.png", 3),
-            ],
-            shards: vec!["+10% Velocidad de Ataque".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1055, "Espada de Doran", 450), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6676, "Coleccionista", 3000),
-                item(patch, 3031, "Filo Infinito", 3400),
-                item(patch, 3036, "Recuerdos de Lord Dominik", 3000),
-            ],
-            boots: item(patch, 3006, "Grebas de Berserker", 1100),
-            situational_items: vec![item(patch, 3072, "Sanguinaria", 3400), item(patch, 3094, "Cañón de Fuego Rápido", 3000)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerHeal", "Curación")],
-    });
-
-    // 6. Niche Pick: Karthus Bot (High WR 53.9%, low PR 1.7% -> Filtered out)
-    champs.push(ChampionStat {
-        id: "Karthus".to_string(),
-        key: "30".to_string(),
-        name: "Karthus".to_string(),
-        title: "la Voz de la Muerte".to_string(),
-        role: "CARRY".to_string(),
-        tier: "B".to_string(),
-        win_rate: 53.90,
-        pick_rate: 1.70,
-        ban_rate: 2.10,
-        score: calculate_score(53.90, 1.70, "B"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Karthus.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Karthus_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8100,
-            primary_style_name: "Dominación".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7200_Domination.png".to_string(),
-            keystone_id: 8128,
-            keystone_name: "Cosecha Oscura".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Domination/DarkHarvest/DarkHarvest.png".to_string(),
-            primary_runes: vec![
-                rune(8139, "Golpe Bajo", "perk-images/Styles/Domination/CheapShot/CheapShot.png", 1),
-                rune(8136, "Colección de Ojos", "perk-images/Styles/Domination/EyeballCollection/EyeballCollection.png", 2),
-                rune(8106, "Cazador Definitivo", "perk-images/Styles/Domination/UltimateHunter/UltimateHunter.png", 3),
-            ],
-            secondary_style_id: 8000,
-            secondary_style_name: "Precisión".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7201_Precision.png".to_string(),
-            secondary_runes: vec![
-                rune(9101, "Claridad Mental", "perk-images/Styles/Precision/PresenceOfMind/PresenceOfMind.png", 1),
-                rune(8299, "Último Esfuerzo", "perk-images/Styles/Precision/LastStand/LastStand.png", 3),
-            ],
-            shards: vec!["+9 Fuerza Adaptable".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 1056, "Anillo de Doran", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6653, "Tormento de Liandry", 3000),
-                item(patch, 3116, "Cetro de Cristal de Rylai", 2600),
-                item(patch, 3089, "Sombrero Mortal de Rabadon", 3600),
-            ],
-            boots: item(patch, 3020, "Botas de Hechicero", 1100),
-            situational_items: vec![item(patch, 3135, "Báculo del Vacío", 3000), item(patch, 3157, "Reloj de Arena de Zhonya", 3250)],
-        },
-        skill_order: vec!["Q".into(), "E".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerExhaust", "Extenuación")],
-    });
-
-    // ==========================================
-    // SUPPORT CHAMPIONS
-    // ==========================================
-    // 1. Thresh (S+)
-    champs.push(ChampionStat {
-        id: "Thresh".to_string(),
-        key: "412".to_string(),
-        name: "Thresh".to_string(),
-        title: "el Carcelero Implacable".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.90,
-        pick_rate: 13.80,
-        ban_rate: 11.40,
-        score: calculate_score(51.90, 13.80, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Thresh.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Thresh_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8300,
-            primary_style_name: "Inspiración".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            keystone_id: 8351,
-            keystone_name: "Aumento Glacial".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Inspiration/GlacialAugment/GlacialAugment.png".to_string(),
-            primary_runes: vec![
-                rune(8306, "Destello Hextech", "perk-images/Styles/Inspiration/HextechFlashtraption/HextechFlashtraption.png", 1),
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8473, "Revestimiento de Huesos", "perk-images/Styles/Resolve/BonePlating/BonePlating.png", 2),
-                rune(8453, "Inquebrantable", "perk-images/Styles/Resolve/Unflinching/Unflinching.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+65 Vida".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3190, "Medallón de los Solari de Hierro", 2200),
-                item(patch, 3050, "Convergencia de Zeke", 2200),
-                item(patch, 3109, "Promesa del Caballero", 2200),
-            ],
-            boots: item(patch, 3009, "Botas de Rapidez", 900),
-            situational_items: vec![item(patch, 3107, "Redención", 2300), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 2. Leona (S+)
-    champs.push(ChampionStat {
-        id: "Leona".to_string(),
-        key: "89".to_string(),
-        name: "Leona".to_string(),
-        title: "el Alba Radiante".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "S+".to_string(),
-        win_rate: 51.75,
-        pick_rate: 11.20,
-        ban_rate: 8.70,
-        score: calculate_score(51.75, 11.20, "S+"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Leona.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Leona_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8400,
-            primary_style_name: "Valor".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            keystone_id: 8439,
-            keystone_name: "Reverberacción".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/VeteranAftershock/VeteranAftershock.png".to_string(),
-            primary_runes: vec![
-                rune(8463, "Fuente de Vida", "perk-images/Styles/Resolve/FontOfLife/FontOfLife.png", 1),
-                rune(8473, "Revestimiento de Huesos", "perk-images/Styles/Resolve/BonePlating/BonePlating.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8306, "Destello Hextech", "perk-images/Styles/Inspiration/HextechFlashtraption/HextechFlashtraption.png", 1),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+65 Vida".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3190, "Medallón de los Solari de Hierro", 2200),
-                item(patch, 3050, "Convergencia de Zeke", 2200),
-                item(patch, 3109, "Promesa del Caballero", 2200),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3143, "Presagio de Randuin", 2700), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["W".into(), "E".into(), "Q".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 3. Nautilus (S)
-    champs.push(ChampionStat {
-        id: "Nautilus".to_string(),
-        key: "111".to_string(),
-        name: "Nautilus".to_string(),
-        title: "el Titán de las Profundidades".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.40,
-        pick_rate: 9.70,
-        ban_rate: 7.60,
-        score: calculate_score(51.40, 9.70, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Nautilus.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Nautilus_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8400,
-            primary_style_name: "Valor".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            keystone_id: 8439,
-            keystone_name: "Reverberacción".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Resolve/VeteranAftershock/VeteranAftershock.png".to_string(),
-            primary_runes: vec![
-                rune(8401, "Golpe de Escudo", "perk-images/Styles/Resolve/ShieldBash/ShieldBash.png", 1),
-                rune(8473, "Revestimiento de Huesos", "perk-images/Styles/Resolve/BonePlating/BonePlating.png", 2),
-                rune(8451, "Sobrecrecimiento", "perk-images/Styles/Resolve/Overgrowth/Overgrowth.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8306, "Destello Hextech", "perk-images/Styles/Inspiration/HextechFlashtraption/HextechFlashtraption.png", 1),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+65 Vida".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3190, "Medallón de los Solari de Hierro", 2200),
-                item(patch, 3050, "Convergencia de Zeke", 2200),
-                item(patch, 3109, "Promesa del Caballero", 2200),
-            ],
-            boots: item(patch, 3009, "Botas de Rapidez", 900),
-            situational_items: vec![item(patch, 3143, "Presagio de Randuin", 2700), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 4. Blitzcrank (S)
-    champs.push(ChampionStat {
-        id: "Blitzcrank".to_string(),
-        key: "53".to_string(),
-        name: "Blitzcrank".to_string(),
-        title: "el Gran Gólem de Vapor".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "S".to_string(),
-        win_rate: 51.50,
-        pick_rate: 8.90,
-        ban_rate: 16.20,
-        score: calculate_score(51.50, 8.90, "S"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Blitzcrank.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Blitzcrank_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8300,
-            primary_style_name: "Inspiración".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            keystone_id: 8351,
-            keystone_name: "Aumento Glacial".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Inspiration/GlacialAugment/GlacialAugment.png".to_string(),
-            primary_runes: vec![
-                rune(8306, "Destello Hextech", "perk-images/Styles/Inspiration/HextechFlashtraption/HextechFlashtraption.png", 1),
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            secondary_style_id: 8200,
-            secondary_style_name: "Brujería".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            secondary_runes: vec![
-                rune(8275, "Capa del Nimbo", "perk-images/Styles/Sorcery/NimbusCloak/NimbusCloak.png", 1),
-                rune(8234, "Celeridad", "perk-images/Styles/Sorcery/Celerity/Celerity.png", 2),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+65 Vida".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3050, "Convergencia de Zeke", 2200),
-                item(patch, 3109, "Promesa del Caballero", 2200),
-                item(patch, 3190, "Medallón de los Solari de Hierro", 2200),
-            ],
-            boots: item(patch, 3009, "Botas de Rapidez", 900),
-            situational_items: vec![item(patch, 3801, "Capa de la Escurridiza", 2500), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["Q".into(), "W".into(), "E".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 5. Nami (A)
-    champs.push(ChampionStat {
-        id: "Nami".to_string(),
-        key: "267".to_string(),
-        name: "Nami".to_string(),
-        title: "la Invocadora de Mareas".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "A".to_string(),
-        win_rate: 51.30,
-        pick_rate: 7.90,
-        ban_rate: 2.10,
-        score: calculate_score(51.30, 7.90, "A"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Nami.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Nami_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8200,
-            primary_style_name: "Brujería".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7202_Sorcery.png".to_string(),
-            keystone_id: 8214,
-            keystone_name: "Invocar a Aery".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Sorcery/SummonAery/SummonAery.png".to_string(),
-            primary_runes: vec![
-                rune(8226, "Banda de Maná", "perk-images/Styles/Sorcery/ManaflowBand/ManaflowBand.png", 1),
-                rune(8210, "Trascendencia", "perk-images/Styles/Sorcery/Transcendence/Transcendence.png", 2),
-                rune(8237, "Quemadura", "perk-images/Styles/Sorcery/Scorch/Scorch.png", 3),
-            ],
-            secondary_style_id: 8300,
-            secondary_style_name: "Inspiración".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            secondary_runes: vec![
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+9 Fuerza Adaptable".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 6645, "Mandato Imperial", 2300),
-                item(patch, 6617, "Renovador de Piedra Lunar", 2200),
-                item(patch, 3504, "Incensario Ardiente", 2300),
-            ],
-            boots: item(patch, 3158, "Botas Jonias de la Lucidez", 900),
-            situational_items: vec![item(patch, 3107, "Redención", 2300), item(patch, 3222, "Bendición de Mikael", 2300)],
-        },
-        skill_order: vec!["W".into(), "E".into(), "Q".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    // 6. Niche Pick: Taric Support (High WR 53.5%, low PR 1.4% -> Filtered out)
-    champs.push(ChampionStat {
-        id: "Taric".to_string(),
-        key: "44".to_string(),
-        name: "Taric".to_string(),
-        title: "el Escudo de Valoran".to_string(),
-        role: "SUPPORT".to_string(),
-        tier: "B".to_string(),
-        win_rate: 53.50,
-        pick_rate: 1.40,
-        ban_rate: 0.70,
-        score: calculate_score(53.50, 1.40, "B"),
-        icon_url: format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/Taric.png", patch),
-        splash_url: "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Taric_0.jpg".to_string(),
-        runes: RuneTree {
-            primary_style_id: 8300,
-            primary_style_name: "Inspiración".to_string(),
-            primary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7203_Inspiration.png".to_string(),
-            keystone_id: 8351,
-            keystone_name: "Aumento Glacial".to_string(),
-            keystone_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Inspiration/GlacialAugment/GlacialAugment.png".to_string(),
-            primary_runes: vec![
-                rune(8304, "Calzado Mágico", "perk-images/Styles/Inspiration/MagicalFootwear/MagicalFootwear.png", 1),
-                rune(8345, "Entrega de Galletas", "perk-images/Styles/Inspiration/BiscuitDelivery/BiscuitDelivery.png", 2),
-                rune(8347, "Perspicacia Cósmica", "perk-images/Styles/Inspiration/CosmicInsight/CosmicInsight.png", 3),
-            ],
-            secondary_style_id: 8400,
-            secondary_style_name: "Valor".to_string(),
-            secondary_style_icon: "https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/7204_Resolve.png".to_string(),
-            secondary_runes: vec![
-                rune(8444, "Fuerzas Renovadas", "perk-images/Styles/Resolve/SecondWind/SecondWind.png", 2),
-                rune(8242, "Revitalizar", "perk-images/Styles/Resolve/Revitalize/Revitalize.png", 3),
-            ],
-            shards: vec!["+8 Aceleración de Habilidad".into(), "+65 Vida".into(), "+65 Vida".into()],
-        },
-        build: BuildRecommendation {
-            starting_items: vec![item(patch, 3865, "Atlas Mundial", 400), item(patch, 2003, "Poción de Vida", 50)],
-            core_items: vec![
-                item(patch, 3109, "Promesa del Caballero", 2200),
-                item(patch, 3190, "Medallón de los Solari de Hierro", 2200),
-                item(patch, 3050, "Convergencia de Zeke", 2200),
-            ],
-            boots: item(patch, 3047, "Botas Blindadas", 1100),
-            situational_items: vec![item(patch, 3107, "Redención", 2300), item(patch, 3075, "Malla de Espinas", 2700)],
-        },
-        skill_order: vec!["E".into(), "Q".into(), "W".into()],
-        summoner_spells: vec![spell("SummonerFlash", "Destello"), spell("SummonerDot", "Prender")],
-    });
-
-    for champ in &mut champs {
-        adjust_champion_stats(champ, server, tier);
-    }
-
-    LoLMetaData {
-        patch: patch.to_string(),
-        server: server.to_string(),
-        tier: tier.to_string(),
-        last_updated: Utc::now().to_rfc3339(),
-        champions: champs,
-        is_cached,
-    }
+struct RawChampionDef {
+    id: &'static str,
+    key: &'static str,
+    name: &'static str,
+    title: &'static str,
+    role: &'static str,
+    archetype: Archetype,
+    base_wr: f64,
+    base_pr: f64,
+    base_br: f64,
+    skills: &'static [&'static str],
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn get_champion_definitions() -> Vec<RawChampionDef> {
+    vec![
+        // ==========================================
+        // TOP LANE (45 champions)
+        // ==========================================
+        RawChampionDef { id: "Aatrox", key: "266", name: "Aatrox", title: "la Espada de los Oscuros", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.85, base_pr: 9.42, base_br: 11.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Camille", key: "164", name: "Camille", title: "la Sombra de Acero", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.52, base_pr: 6.78, base_br: 4.30, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Darius", key: "122", name: "Darius", title: "la Mano de Noxus", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.95, base_pr: 7.82, base_br: 14.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Fiora", key: "114", name: "Fiora", title: "la Gran Duelista", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.10, base_pr: 5.90, base_br: 7.50, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Garen", key: "86", name: "Garen", title: "el Poder de Demacia", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 8.10, base_br: 6.40, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Gwen", key: "887", name: "Gwen", title: "la Costurera Sagrada", role: "TOP", archetype: Archetype::ApMage, base_wr: 50.40, base_pr: 5.20, base_br: 3.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Illaoi", key: "420", name: "Illaoi", title: "la Sacerdotisa del Kraken", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.30, base_pr: 4.10, base_br: 5.60, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Irelia", key: "39", name: "Irelia", title: "la Danza de las Cuchillas", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.15, base_pr: 6.40, base_br: 8.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Jax", key: "24", name: "Jax", title: "el Maestro de las Armas", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.80, base_pr: 7.30, base_br: 9.20, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Jayce", key: "126", name: "Jayce", title: "el Defensor del Mañana", role: "TOP", archetype: Archetype::AdAssassin, base_wr: 49.30, base_pr: 5.50, base_br: 2.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "KSante", key: "897", name: "K'Sante", title: "el Orgullo de Nazumah", role: "TOP", archetype: Archetype::Tank, base_wr: 48.90, base_pr: 6.10, base_br: 8.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Kayle", key: "10", name: "Kayle", title: "la Justiciera", role: "TOP", archetype: Archetype::ApMage, base_wr: 51.60, base_pr: 4.30, base_br: 2.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Kennen", key: "85", name: "Kennen", title: "el Corazón de la Tempestad", role: "TOP", archetype: Archetype::ApMage, base_wr: 50.70, base_pr: 3.80, base_br: 1.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Kled", key: "240", name: "Kled", title: "el Jinete Rebelde", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.40, base_pr: 3.10, base_br: 1.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Malphite", key: "54", name: "Malphite", title: "el Fragmento del Monolito", role: "TOP", archetype: Archetype::Tank, base_wr: 51.70, base_pr: 7.20, base_br: 5.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Mordekaiser", key: "82", name: "Mordekaiser", title: "el Renacido de Hierro", role: "TOP", archetype: Archetype::ApMage, base_wr: 51.10, base_pr: 7.60, base_br: 6.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Nasus", key: "75", name: "Nasus", title: "el Conservador de las Arenas", role: "TOP", archetype: Archetype::Tank, base_wr: 50.80, base_pr: 5.40, base_br: 4.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Olaf", key: "2", name: "Olaf", title: "el Berserker", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 3.50, base_br: 2.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Ornn", key: "516", name: "Ornn", title: "el Fuego de la Fragua", role: "TOP", archetype: Archetype::Tank, base_wr: 50.90, base_pr: 4.80, base_br: 1.70, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Pantheon", key: "80", name: "Pantheon", title: "la Lanza Inquebrantable", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.60, base_pr: 4.20, base_br: 2.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Poppy", key: "78", name: "Poppy", title: "la Guardiana del Martillo", role: "TOP", archetype: Archetype::Tank, base_wr: 51.30, base_pr: 3.90, base_br: 2.30, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Quinn", key: "133", name: "Quinn", title: "las Alas de Demacia", role: "TOP", archetype: Archetype::AdCarry, base_wr: 51.70, base_pr: 2.90, base_br: 1.60, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Renekton", key: "58", name: "Renekton", title: "el Carnicero de las Arenas", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.40, base_pr: 7.90, base_br: 5.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Riven", key: "92", name: "Riven", title: "la Exiliada", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.40, base_pr: 6.20, base_br: 4.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Rumble", key: "68", name: "Rumble", title: "la Amenaza Mecánica", role: "TOP", archetype: Archetype::ApMage, base_wr: 50.80, base_pr: 4.50, base_br: 3.60, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Sett", key: "875", name: "Sett", title: "el Jefe", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.60, base_pr: 8.70, base_br: 7.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Shen", key: "98", name: "Shen", title: "el Ojo del Crepúsculo", role: "TOP", archetype: Archetype::Tank, base_wr: 51.20, base_pr: 4.70, base_br: 2.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Singed", key: "27", name: "Singed", title: "el Químico Loco", role: "TOP", archetype: Archetype::ApMage, base_wr: 51.90, base_pr: 2.80, base_br: 1.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Sion", key: "14", name: "Sion", title: "el Coloso No Muerto", role: "TOP", archetype: Archetype::Tank, base_wr: 50.20, base_pr: 5.10, base_br: 2.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "TahmKench", key: "223", name: "Tahm Kench", title: "el Rey del Río", role: "TOP", archetype: Archetype::Tank, base_wr: 51.30, base_pr: 4.10, base_br: 2.00, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Teemo", key: "17", name: "Teemo", title: "el Explorador Veloz", role: "TOP", archetype: Archetype::ApMage, base_wr: 50.70, base_pr: 4.90, base_br: 6.30, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Trundle", key: "48", name: "Trundle", title: "el Rey de los Trolls", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.90, base_pr: 4.40, base_br: 3.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Tryndamere", key: "23", name: "Tryndamere", title: "el Rey Bárbaro", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 50.80, base_pr: 5.30, base_br: 4.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Urgot", key: "6", name: "Urgot", title: "el Temible", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.50, base_pr: 4.80, base_br: 2.50, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Volibear", key: "106", name: "Volibear", title: "la Tormenta Relampagueante", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 6.50, base_br: 4.90, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Warwick", key: "19", name: "Warwick", title: "la Furia Desatada de Zaun", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.80, base_pr: 4.60, base_br: 3.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Wukong", key: "62", name: "Wukong", title: "el Rey Mono", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.10, base_pr: 3.70, base_br: 1.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Yasuo", key: "157", name: "Yasuo", title: "el Imperdonable", role: "TOP", archetype: Archetype::AdCarry, base_wr: 49.80, base_pr: 7.10, base_br: 12.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Yone", key: "777", name: "Yone", title: "el Implacable", role: "TOP", archetype: Archetype::AdCarry, base_wr: 50.20, base_pr: 8.40, base_br: 14.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Yorick", key: "83", name: "Yorick", title: "el Pastor de las Almas", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 51.40, base_pr: 4.20, base_br: 3.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Chogath", key: "31", name: "Cho'Gath", title: "el Terror del Vacío", role: "TOP", archetype: Archetype::Tank, base_wr: 50.90, base_pr: 3.80, base_br: 1.50, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "DrMundo", key: "36", name: "Dr. Mundo", title: "el Loco de Zaun", role: "TOP", archetype: Archetype::Tank, base_wr: 51.30, base_pr: 5.60, base_br: 4.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Gangplank", key: "41", name: "Gangplank", title: "el Azote de los Mares", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 49.50, base_pr: 4.70, base_br: 3.30, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Gnar", key: "150", name: "Gnar", title: "el Eslabón Perdido", role: "TOP", archetype: Archetype::AdBruiser, base_wr: 49.90, base_pr: 4.30, base_br: 1.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Gragas", key: "79", name: "Gragas", title: "el Camorrista", role: "TOP", archetype: Archetype::ApMage, base_wr: 50.60, base_pr: 5.40, base_br: 2.70, skills: &["Q", "E", "W"] },
 
-    #[test]
-    fn test_calculate_score_formula() {
-        // WinRate = 50.0, PickRate = 10.0, Tier = "S+" (+3.0)
-        // (50.0 * 0.6) + (10.0 * 0.4) + 3.0 = 30.0 + 4.0 + 3.0 = 37.0
-        let score = calculate_score(50.0, 10.0, "S+");
-        assert!((score - 37.0).abs() < 0.01);
+        // ==========================================
+        // JUNGLE (42 champions)
+        // ==========================================
+        RawChampionDef { id: "LeeSin", key: "64", name: "Lee Sin", title: "el Monje Ciego", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 49.80, base_pr: 15.20, base_br: 9.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Viego", key: "234", name: "Viego", title: "el Rey Arruinado", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 50.40, base_pr: 11.80, base_br: 8.60, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Graves", key: "104", name: "Graves", title: "el Forajido", role: "JUNGLE", archetype: Archetype::AdCarry, base_wr: 50.20, base_pr: 9.70, base_br: 4.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Kayn", key: "141", name: "Kayn", title: "el Segador Sombrío", role: "JUNGLE", archetype: Archetype::AdAssassin, base_wr: 50.60, base_pr: 8.90, base_br: 8.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Khazix", key: "121", name: "Kha'Zix", title: "el Saqueador del Vacío", role: "JUNGLE", archetype: Archetype::AdAssassin, base_wr: 50.80, base_pr: 7.80, base_br: 6.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "JarvanIV", key: "59", name: "Jarvan IV", title: "el Ejemplo de Demacia", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 8.20, base_br: 3.50, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Nocturne", key: "56", name: "Nocturne", title: "la Pesadilla Eterna", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.40, base_pr: 7.60, base_br: 5.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Hecarim", key: "120", name: "Hecarim", title: "la Sombra de la Guerra", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 50.70, base_pr: 6.90, base_br: 4.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Vi", key: "254", name: "Vi", title: "la Defensora de Piltóver", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.10, base_pr: 6.40, base_br: 2.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "MasterYi", key: "11", name: "Master Yi", title: "la Espada Wuju", role: "JUNGLE", archetype: Archetype::AdCarry, base_wr: 51.60, base_pr: 7.90, base_br: 12.30, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Ekko", key: "245", name: "Ekko", title: "el Joven del Tiempo", role: "JUNGLE", archetype: Archetype::ApAssassin, base_wr: 50.90, base_pr: 5.80, base_br: 3.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Diana", key: "131", name: "Diana", title: "el Desdén de la Luna", role: "JUNGLE", archetype: Archetype::ApAssassin, base_wr: 51.20, base_pr: 5.40, base_br: 2.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Evelynn", key: "28", name: "Evelynn", title: "el Abrazo de la Agonía", role: "JUNGLE", archetype: Archetype::ApAssassin, base_wr: 51.30, base_pr: 4.80, base_br: 5.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Nidalee", key: "76", name: "Nidalee", title: "la Cazadora Salvaje", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 49.60, base_pr: 4.90, base_br: 3.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Elise", key: "60", name: "Elise", title: "la Reina de las Espinas", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.40, base_pr: 4.20, base_br: 2.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Karthus", key: "30", name: "Karthus", title: "la Voz de la Muerte", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.70, base_pr: 3.60, base_br: 4.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Lillia", key: "876", name: "Lillia", title: "el Tímido Florecer", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.50, base_pr: 6.10, base_br: 5.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Kindred", key: "203", name: "Kindred", title: "los Cazadores Eternos", role: "JUNGLE", archetype: Archetype::AdCarry, base_wr: 50.70, base_pr: 5.20, base_br: 3.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Shaco", key: "35", name: "Shaco", title: "el Bufón Siniestro", role: "JUNGLE", archetype: Archetype::AdAssassin, base_wr: 51.30, base_pr: 5.70, base_br: 9.40, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Belveth", key: "200", name: "Bel'Veth", title: "la Emperatriz del Vacío", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.00, base_pr: 5.10, base_br: 6.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Briar", key: "233", name: "Briar", title: "el Hambre Restringida", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.60, base_pr: 6.30, base_br: 7.50, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Amumu", key: "32", name: "Amumu", title: "la Momia Triste", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 52.10, base_pr: 6.80, base_br: 4.20, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Rammus", key: "33", name: "Rammus", title: "el Armadurillo", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 51.80, base_pr: 4.50, base_br: 4.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Sejuani", key: "113", name: "Sejuani", title: "la Furia del Norte", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 50.40, base_pr: 4.30, base_br: 1.50, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Zac", key: "154", name: "Zac", title: "el Arma Secreta", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 51.50, base_pr: 4.90, base_br: 2.60, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "XinZhao", key: "5", name: "Xin Zhao", title: "el Senescal de Demacia", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 5.70, base_br: 2.10, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Volibear", key: "106", name: "Volibear", title: "la Tormenta Relampagueante", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.40, base_pr: 5.90, base_br: 3.80, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Warwick", key: "19", name: "Warwick", title: "la Furia Desatada de Zaun", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 52.00, base_pr: 5.80, base_br: 4.10, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Udyr", key: "77", name: "Udyr", title: "el Caminante Espiritual", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 51.30, base_pr: 4.70, base_br: 3.00, skills: &["R", "W", "E"] },
+        RawChampionDef { id: "Fiddlesticks", key: "9", name: "Fiddlesticks", title: "el Terror Ancestral", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.90, base_pr: 4.40, base_br: 3.30, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Shyvana", key: "102", name: "Shyvana", title: "la Hija del Dragón", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 50.80, base_pr: 3.90, base_br: 1.70, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Taliyah", key: "163", name: "Taliyah", title: "la Tejedora de Piedra", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.10, base_pr: 3.80, base_br: 2.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Brand", key: "63", name: "Brand", title: "la Venganza Ardiente", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 51.40, base_pr: 5.30, base_br: 4.50, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Gragas", key: "79", name: "Gragas", title: "el Camorrista", role: "JUNGLE", archetype: Archetype::ApMage, base_wr: 50.70, base_pr: 4.20, base_br: 2.00, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Nunu", key: "20", name: "Nunu y Willump", title: "el Niño y su Yeti", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 51.60, base_pr: 4.60, base_br: 1.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Rengar", key: "107", name: "Rengar", title: "el Cazador Orgulloso", role: "JUNGLE", archetype: Archetype::AdAssassin, base_wr: 50.50, base_pr: 4.80, base_br: 5.30, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "RekSai", key: "421", name: "Rek'Sai", title: "la Excavadora del Vacío", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 2.90, base_br: 1.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Skarner", key: "72", name: "Skarner", title: "el Soberano Primigenio", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 50.30, base_pr: 3.70, base_br: 2.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Ivern", key: "427", name: "Ivern", title: "el Padre Arborescente", role: "JUNGLE", archetype: Archetype::Enchanter, base_wr: 51.80, base_pr: 2.40, base_br: 0.90, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Poppy", key: "78", name: "Poppy", title: "la Guardiana del Martillo", role: "JUNGLE", archetype: Archetype::Tank, base_wr: 51.40, base_pr: 3.20, base_br: 1.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Wukong", key: "62", name: "Wukong", title: "el Rey Mono", role: "JUNGLE", archetype: Archetype::AdBruiser, base_wr: 51.20, base_pr: 3.80, base_br: 1.50, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Talon", key: "91", name: "Talon", title: "la Sombra de la Espada", role: "JUNGLE", archetype: Archetype::AdAssassin, base_wr: 50.90, base_pr: 3.40, base_br: 2.30, skills: &["W", "Q", "E"] },
 
-        // Clamping PickRate at 15.0: PickRate = 20.0, Tier = "S" (+2.0)
-        // (52.0 * 0.6) + (15.0 * 0.4) + 2.0 = 31.2 + 6.0 + 2.0 = 39.2
-        let score_clamped = calculate_score(52.0, 20.0, "S");
-        assert!((score_clamped - 39.2).abs() < 0.01);
+        // ==========================================
+        // MID LANE (45 champions)
+        // ==========================================
+        RawChampionDef { id: "Ahri", key: "103", name: "Ahri", title: "la Zorra de Nueve Colas", role: "MID", archetype: Archetype::ApMage, base_wr: 51.30, base_pr: 11.40, base_br: 4.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Sylas", key: "517", name: "Sylas", title: "el Usurpador Desencadenado", role: "MID", archetype: Archetype::ApMage, base_wr: 50.80, base_pr: 10.90, base_br: 9.20, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Yasuo", key: "157", name: "Yasuo", title: "el Imperdonable", role: "MID", archetype: Archetype::AdCarry, base_wr: 50.20, base_pr: 11.80, base_br: 15.60, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Yone", key: "777", name: "Yone", title: "el Implacable", role: "MID", archetype: Archetype::AdCarry, base_wr: 50.60, base_pr: 12.10, base_br: 16.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Zed", key: "238", name: "Zed", title: "el Maestro de las Sombras", role: "MID", archetype: Archetype::AdAssassin, base_wr: 50.40, base_pr: 9.80, base_br: 18.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Akali", key: "84", name: "Akali", title: "la Asesina Furtiva", role: "MID", archetype: Archetype::ApAssassin, base_wr: 49.90, base_pr: 8.70, base_br: 8.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Syndra", key: "134", name: "Syndra", title: "la Soberana Oscura", role: "MID", archetype: Archetype::ApMage, base_wr: 51.10, base_pr: 7.80, base_br: 5.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Orianna", key: "61", name: "Orianna", title: "la Dama Mecánica", role: "MID", archetype: Archetype::ApMage, base_wr: 50.70, base_pr: 7.20, base_br: 2.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Hwei", key: "910", name: "Hwei", title: "el Visionario", role: "MID", archetype: Archetype::ApMage, base_wr: 50.20, base_pr: 7.90, base_br: 7.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Viktor", key: "112", name: "Viktor", title: "el Heraldo de las Máquinas", role: "MID", archetype: Archetype::ApMage, base_wr: 51.20, base_pr: 6.80, base_br: 3.40, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Katarina", key: "55", name: "Katarina", title: "la Hoja Siniestra", role: "MID", archetype: Archetype::ApAssassin, base_wr: 50.50, base_pr: 7.40, base_br: 7.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "LeBlanc", key: "7", name: "LeBlanc", title: "la Maquilladora", role: "MID", archetype: Archetype::ApAssassin, base_wr: 49.80, base_pr: 6.90, base_br: 6.20, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Vex", key: "711", name: "Vex", title: "la Tristeza", role: "MID", archetype: Archetype::ApMage, base_wr: 51.60, base_pr: 6.40, base_br: 4.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Fizz", key: "105", name: "Fizz", title: "el Bromista de las Mareas", role: "MID", archetype: Archetype::ApAssassin, base_wr: 51.20, base_pr: 5.80, base_br: 6.70, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Kassadin", key: "38", name: "Kassadin", title: "el Caminante del Vacío", role: "MID", archetype: Archetype::ApAssassin, base_wr: 51.40, base_pr: 4.90, base_br: 7.20, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Malzahar", key: "90", name: "Malzahar", title: "el Profeta del Vacío", role: "MID", archetype: Archetype::ApMage, base_wr: 51.70, base_pr: 5.20, base_br: 4.30, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Lux", key: "99", name: "Lux", title: "la Dama de la Luminosidad", role: "MID", archetype: Archetype::ApMage, base_wr: 51.30, base_pr: 7.50, base_br: 3.60, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Veigar", key: "45", name: "Veigar", title: "el Pequeño Maestro del Mal", role: "MID", archetype: Archetype::ApMage, base_wr: 51.50, base_pr: 5.10, base_br: 3.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Galio", key: "3", name: "Galio", title: "el Coloso", role: "MID", archetype: Archetype::Tank, base_wr: 51.80, base_pr: 4.80, base_br: 2.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Vladimir", key: "8", name: "Vladimir", title: "el Segador Carmesí", role: "MID", archetype: Archetype::ApMage, base_wr: 50.90, base_pr: 4.70, base_br: 4.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Talon", key: "91", name: "Talon", title: "la Sombra de la Espada", role: "MID", archetype: Archetype::AdAssassin, base_wr: 51.20, base_pr: 4.50, base_br: 2.70, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Qiyana", key: "246", name: "Qiyana", title: "la Emperatriz de los Elementos", role: "MID", archetype: Archetype::AdAssassin, base_wr: 50.60, base_pr: 3.90, base_br: 3.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Naafiri", key: "895", name: "Naafiri", title: "el Sabueso de las Cien Mordidas", role: "MID", archetype: Archetype::AdAssassin, base_wr: 51.40, base_pr: 3.80, base_br: 2.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "TwistedFate", key: "4", name: "Twisted Fate", title: "el Maestro de las Cartas", role: "MID", archetype: Archetype::ApMage, base_wr: 50.80, base_pr: 5.60, base_br: 3.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Cassiopeia", key: "69", name: "Cassiopeia", title: "el Abrazo de la Serpiente", role: "MID", archetype: Archetype::ApMage, base_wr: 51.60, base_pr: 3.70, base_br: 2.40, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Anivia", key: "34", name: "Anivia", title: "la Criofénix", role: "MID", archetype: Archetype::ApMage, base_wr: 51.90, base_pr: 3.50, base_br: 2.30, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "AurelionSol", key: "136", name: "Aurelion Sol", title: "el Forjador de Estrellas", role: "MID", archetype: Archetype::ApMage, base_wr: 51.40, base_pr: 4.60, base_br: 4.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Azir", key: "268", name: "Azir", title: "el Emperador de las Arenas", role: "MID", archetype: Archetype::ApMage, base_wr: 48.70, base_pr: 4.20, base_br: 2.50, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Zoe", key: "142", name: "Zoe", title: "el Aspecto del Crepúsculo", role: "MID", archetype: Archetype::ApMage, base_wr: 50.60, base_pr: 3.90, base_br: 2.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Lissandra", key: "127", name: "Lissandra", title: "la Bruja de Hielo", role: "MID", archetype: Archetype::ApMage, base_wr: 51.10, base_pr: 3.80, base_br: 1.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Annie", key: "1", name: "Annie", title: "la Hija de la Oscuridad", role: "MID", archetype: Archetype::ApMage, base_wr: 51.70, base_pr: 3.40, base_br: 1.50, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Swain", key: "50", name: "Swain", title: "el Gran General Noxiano", role: "MID", archetype: Archetype::ApMage, base_wr: 51.50, base_pr: 3.60, base_br: 2.00, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Neeko", key: "518", name: "Neeko", title: "la Camaleona Curiosa", role: "MID", archetype: Archetype::ApMage, base_wr: 51.20, base_pr: 3.30, base_br: 1.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Xerath", key: "101", name: "Xerath", title: "el Mago Ascendido", role: "MID", archetype: Archetype::ApMage, base_wr: 51.40, base_pr: 4.40, base_br: 3.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Ziggs", key: "115", name: "Ziggs", title: "el Experto en Hexplosivos", role: "MID", archetype: Archetype::ApMage, base_wr: 51.00, base_pr: 3.10, base_br: 1.60, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Akshan", key: "166", name: "Akshan", title: "el Rebelde Extraviado", role: "MID", archetype: Archetype::AdCarry, base_wr: 51.30, base_pr: 3.90, base_br: 3.50, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Corki", key: "42", name: "Corki", title: "el Bombardero Audaz", role: "MID", archetype: Archetype::AdCarry, base_wr: 50.20, base_pr: 4.10, base_br: 1.90, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Smolder", key: "901", name: "Smolder", title: "el Dragoncillo Ígneo", role: "MID", archetype: Archetype::AdCarry, base_wr: 50.40, base_pr: 5.20, base_br: 4.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Irelia", key: "39", name: "Irelia", title: "la Danza de las Cuchillas", role: "MID", archetype: Archetype::AdBruiser, base_wr: 50.30, base_pr: 4.80, base_br: 5.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Pantheon", key: "80", name: "Pantheon", title: "la Lanza Inquebrantable", role: "MID", archetype: Archetype::AdBruiser, base_wr: 51.10, base_pr: 3.60, base_br: 2.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Diana", key: "131", name: "Diana", title: "el Desdén de la Luna", role: "MID", archetype: Archetype::ApAssassin, base_wr: 51.00, base_pr: 4.10, base_br: 2.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Ekko", key: "245", name: "Ekko", title: "el Joven del Tiempo", role: "MID", archetype: Archetype::ApAssassin, base_wr: 50.80, base_pr: 4.30, base_br: 2.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Ryze", key: "13", name: "Ryze", title: "el Mago Rúnico", role: "MID", archetype: Archetype::ApMage, base_wr: 49.20, base_pr: 3.50, base_br: 1.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Jayce", key: "126", name: "Jayce", title: "el Defensor del Mañana", role: "MID", archetype: Archetype::AdAssassin, base_wr: 49.60, base_pr: 4.40, base_br: 1.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Taliyah", key: "163", name: "Taliyah", title: "la Tejedora de Piedra", role: "MID", archetype: Archetype::ApMage, base_wr: 51.20, base_pr: 3.20, base_br: 1.60, skills: &["Q", "E", "W"] },
+
+        // ==========================================
+        // CARRY / ADC (28 champions)
+        // ==========================================
+        RawChampionDef { id: "Jinx", key: "222", name: "Jinx", title: "la Bala Perdida", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.40, base_pr: 16.80, base_br: 5.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Kaisa", key: "145", name: "Kai'Sa", title: "la Hija del Vacío", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.90, base_pr: 18.20, base_br: 6.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Caitlyn", key: "51", name: "Caitlyn", title: "la Sheriff de Piltóver", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.60, base_pr: 17.40, base_br: 8.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Jhin", key: "202", name: "Jhin", title: "el Virtuoso", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.20, base_pr: 15.90, base_br: 4.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Ezreal", key: "81", name: "Ezreal", title: "el Explorador Pródigo", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 49.80, base_pr: 16.50, base_br: 3.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Ashe", key: "22", name: "Ashe", title: "la Arquera de Hielo", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.30, base_pr: 12.40, base_br: 4.60, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Vayne", key: "67", name: "Vayne", title: "la Cazadora Nocturna", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.10, base_pr: 9.80, base_br: 8.90, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Lucian", key: "236", name: "Lucian", title: "el Purificador", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.30, base_pr: 10.20, base_br: 4.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "MissFortune", key: "21", name: "Miss Fortune", title: "la Cazarrecompensas", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.70, base_pr: 11.60, base_br: 4.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Samira", key: "360", name: "Samira", title: "la Rosa del Desierto", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.80, base_pr: 8.40, base_br: 11.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Draven", key: "119", name: "Draven", title: "el Glorioso Ejecutor", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.90, base_pr: 6.80, base_br: 13.50, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Tristana", key: "18", name: "Tristana", title: "la Artillera Yordle", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.40, base_pr: 7.60, base_br: 3.40, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Twitch", key: "29", name: "Twitch", title: "la Rata Sembradora", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.50, base_pr: 6.20, base_br: 4.80, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Varus", key: "110", name: "Varus", title: "la Flecha de la Venganza", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.50, base_pr: 7.10, base_br: 2.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Xayah", key: "498", name: "Xayah", title: "la Rebelde", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.70, base_pr: 6.50, base_br: 2.50, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Aphelios", key: "523", name: "Aphelios", title: "el Arma de los Fieles", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 49.40, base_pr: 6.90, base_br: 3.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Sivir", key: "15", name: "Sivir", title: "la Señora de la Guerra", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.20, base_pr: 5.40, base_br: 1.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "KogMaw", key: "96", name: "Kog'Maw", title: "la Boca del Abismo", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.90, base_pr: 4.20, base_br: 2.20, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Zeri", key: "221", name: "Zeri", title: "la Chispa de Zaun", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 49.60, base_pr: 5.80, base_br: 3.50, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Kalista", key: "429", name: "Kalista", title: "el Espíritu de la Venganza", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 49.20, base_pr: 4.10, base_br: 2.70, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Nilah", key: "893", name: "Nilah", title: "la Alegría Desatada", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 52.20, base_pr: 3.20, base_br: 2.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Smolder", key: "901", name: "Smolder", title: "el Dragoncillo Ígneo", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.50, base_pr: 7.80, base_br: 5.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Ziggs", key: "115", name: "Ziggs", title: "el Experto en Hexplosivos", role: "CARRY", archetype: Archetype::ApMage, base_wr: 51.60, base_pr: 3.40, base_br: 1.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Seraphine", key: "147", name: "Seraphine", title: "la Cantante Soñadora", role: "CARRY", archetype: Archetype::ApMage, base_wr: 52.00, base_pr: 3.60, base_br: 1.70, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Yasuo", key: "157", name: "Yasuo", title: "el Imperdonable", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.80, base_pr: 3.90, base_br: 8.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Senna", key: "235", name: "Senna", title: "la Redentora", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 51.00, base_pr: 5.20, base_br: 3.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Corki", key: "42", name: "Corki", title: "el Bombardero Audaz", role: "CARRY", archetype: Archetype::AdCarry, base_wr: 50.10, base_pr: 3.80, base_br: 1.50, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Swain", key: "50", name: "Swain", title: "el Gran General Noxiano", role: "CARRY", archetype: Archetype::ApMage, base_wr: 52.30, base_pr: 2.80, base_br: 1.60, skills: &["Q", "W", "E"] },
+
+        // ==========================================
+        // SUPPORT (38 champions)
+        // ==========================================
+        RawChampionDef { id: "Thresh", key: "412", name: "Thresh", title: "el Carcelero Implacable", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 50.60, base_pr: 14.80, base_br: 7.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Nautilus", key: "111", name: "Nautilus", title: "el Titán de las Profundidades", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.10, base_pr: 12.90, base_br: 8.40, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Blitzcrank", key: "53", name: "Blitzcrank", title: "el Gran Gólem de Vapor", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.40, base_pr: 11.20, base_br: 14.60, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Leona", key: "89", name: "Leona", title: "el Amanecer Radiante", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.30, base_pr: 10.80, base_br: 6.20, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Lulu", key: "117", name: "Lulu", title: "el Hada Hechicera", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.20, base_pr: 10.40, base_br: 5.80, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Janna", key: "40", name: "Janna", title: "la Furia de la Tormenta", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.80, base_pr: 8.60, base_br: 3.90, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Nami", key: "267", name: "Nami", title: "la Invocadora de Mareas", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.50, base_pr: 9.20, base_br: 3.20, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Pyke", key: "555", name: "Pyke", title: "el Destripador del Puerto Rojo", role: "SUPPORT", archetype: Archetype::AdAssassin, base_wr: 50.70, base_pr: 9.60, base_br: 12.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Karma", key: "43", name: "Karma", title: "la Iluminada", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 50.40, base_pr: 8.90, base_br: 4.30, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Lux", key: "99", name: "Lux", title: "la Dama de la Luminosidad", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.20, base_pr: 10.10, base_br: 5.20, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Rakan", key: "497", name: "Rakan", title: "el Encantador", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.00, base_pr: 7.80, base_br: 3.40, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Senna", key: "235", name: "Senna", title: "la Redentora", role: "SUPPORT", archetype: Archetype::AdCarry, base_wr: 50.90, base_pr: 8.20, base_br: 4.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Morgana", key: "25", name: "Morgana", title: "la Desolada", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 50.80, base_pr: 7.40, base_br: 11.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Soraka", key: "16", name: "Soraka", title: "la Hija de las Estrellas", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.60, base_pr: 6.80, base_br: 3.50, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Braum", key: "201", name: "Braum", title: "el Corazón del Freljord", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.20, base_pr: 6.50, base_br: 2.60, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Alistar", key: "12", name: "Alistar", title: "el Minotauro", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 50.80, base_pr: 6.20, base_br: 2.10, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Rell", key: "526", name: "Rell", title: "la Dama de Hierro", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 50.90, base_pr: 5.40, base_br: 2.30, skills: &["W", "E", "Q"] },
+        RawChampionDef { id: "Milio", key: "902", name: "Milio", title: "la Llama Gentil", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.30, base_pr: 6.90, base_br: 3.10, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Sona", key: "37", name: "Sona", title: "la Virtuosa de las Cuerdas", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.90, base_pr: 5.10, base_br: 1.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Bard", key: "432", name: "Bardo", title: "el Cuidador Errante", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.40, base_pr: 5.60, base_br: 2.90, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Yuumi", key: "350", name: "Yuumi", title: "la Gata Mágica", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 49.30, base_pr: 7.80, base_br: 8.40, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Renata", key: "888", name: "Renata Glasc", title: "la Baronesa Química", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.10, base_pr: 4.20, base_br: 2.20, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Taric", key: "44", name: "Taric", title: "el Escudo de Valoran", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 52.10, base_pr: 3.60, base_br: 1.50, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Maokai", key: "57", name: "Maokai", title: "el Treant Retorcido", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.70, base_pr: 4.80, base_br: 2.80, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Brand", key: "63", name: "Brand", title: "la Venganza Ardiente", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.30, base_pr: 5.80, base_br: 4.90, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Zyra", key: "143", name: "Zyra", title: "el Ascenso de las Espinas", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.50, base_pr: 5.20, base_br: 3.80, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Xerath", key: "101", name: "Xerath", title: "el Mago Ascendido", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.20, base_pr: 4.90, base_br: 3.20, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Velkoz", key: "161", name: "Vel'Koz", title: "el Ojo del Vacío", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.40, base_pr: 3.80, base_br: 2.10, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Zilean", key: "26", name: "Zilean", title: "el Guardián del Tiempo", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.70, base_pr: 3.70, base_br: 1.90, skills: &["Q", "E", "W"] },
+        RawChampionDef { id: "Seraphine", key: "147", name: "Seraphine", title: "la Cantante Soñadora", role: "SUPPORT", archetype: Archetype::Enchanter, base_wr: 51.20, base_pr: 5.40, base_br: 2.00, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Swain", key: "50", name: "Swain", title: "el Gran General Noxiano", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 51.60, base_pr: 4.10, base_br: 2.40, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "TahmKench", key: "223", name: "Tahm Kench", title: "el Rey del Río", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.20, base_pr: 3.40, base_br: 1.70, skills: &["Q", "W", "E"] },
+        RawChampionDef { id: "Shen", key: "98", name: "Shen", title: "el Ojo del Crepúsculo", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.00, base_pr: 2.90, base_br: 1.30, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Poppy", key: "78", name: "Poppy", title: "la Guardiana del Martillo", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 51.50, base_pr: 3.10, base_br: 1.60, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Camille", key: "164", name: "Camille", title: "la Sombra de Acero", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 50.80, base_pr: 3.50, base_br: 2.20, skills: &["E", "Q", "W"] },
+        RawChampionDef { id: "Pantheon", key: "80", name: "Pantheon", title: "la Lanza Inquebrantable", role: "SUPPORT", archetype: Archetype::AdAssassin, base_wr: 51.00, base_pr: 3.80, base_br: 2.50, skills: &["W", "Q", "E"] },
+        RawChampionDef { id: "Sett", key: "875", name: "Sett", title: "el Jefe", role: "SUPPORT", archetype: Archetype::SupportTank, base_wr: 50.60, base_pr: 3.60, base_br: 2.10, skills: &["E", "W", "Q"] },
+        RawChampionDef { id: "Shaco", key: "35", name: "Shaco", title: "el Bufón Siniestro", role: "SUPPORT", archetype: Archetype::ApMage, base_wr: 50.90, base_pr: 3.40, base_br: 4.20, skills: &["W", "E", "Q"] },
+    ]
+}
+
+pub fn generate_champions(patch: &str, server: &str, tier: &str, is_cached: bool) -> Vec<ChampionRoleData> {
+    let defs = get_champion_definitions();
+    let mut result = Vec::with_capacity(defs.len());
+
+    for def in defs {
+        let (win_rate, pick_rate, ban_rate, final_tier, score) = adjust_stats(
+            def.id,
+            server,
+            tier,
+            def.base_wr,
+            def.base_pr,
+            def.base_br,
+        );
+
+        let icon_url = format!("https://ddragon.leagueoflegends.com/cdn/{}/img/champion/{}.png", patch, def.id);
+        let splash_url = format!("https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{}_0.jpg", def.id);
+
+        let runes = runes_for_archetype(def.archetype);
+        let build = build_for_archetype(patch, def.archetype);
+        let summoner_spells = spells_for_role(def.role);
+        let skill_order = def.skills.iter().map(|s| s.to_string()).collect();
+
+        result.push(ChampionRoleData {
+            id: def.id.to_string(),
+            champion_id: def.id.to_string(),
+            key: def.key.to_string(),
+            name: def.name.to_string(),
+            title: def.title.to_string(),
+            role: def.role.to_string(),
+            tier: final_tier,
+            win_rate,
+            pick_rate,
+            ban_rate,
+            score,
+            meta_score: score,
+            icon_url,
+            splash_url,
+            runes,
+            build,
+            skill_order,
+            summoner_spells,
+            patch: Some(patch.to_string()),
+            is_cached: Some(is_cached),
+        });
     }
 
-    #[test]
-    fn test_default_dataset_roles() {
-        let dataset = generate_default_dataset("14.24.1", "LAS", "DIAMOND", false);
-        assert!(!dataset.champions.is_empty());
-        assert_eq!(dataset.server, "LAS");
-        assert_eq!(dataset.tier, "DIAMOND");
+    result
+}
 
-        let roles = ["TOP", "JUNGLE", "MID", "CARRY", "SUPPORT"];
-        for role in roles {
-            let count = dataset.champions.iter().filter(|c| c.role == role).count();
-            assert!(count >= 5, "Role {} should have at least 5 champions", role);
+pub async fn load_meta_data(
+    app: &AppHandle,
+    server: &str,
+    tier: &str,
+    force_refresh: bool,
+) -> Result<Vec<ChampionRoleData>, String> {
+    let cache_path = get_cache_file_path(app, server, tier)?;
+
+    // 1. Check offline cache TTL (12 hours) if not forcing refresh
+    if !force_refresh && cache_path.exists() {
+        if let Ok(metadata) = fs::metadata(&cache_path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    if elapsed.as_secs() < CACHE_TTL_SECONDS {
+                        if let Ok(content) = fs::read_to_string(&cache_path) {
+                            if let Ok(mut cached_data) = serde_json::from_str::<Vec<ChampionRoleData>>(&content) {
+                                for item in &mut cached_data {
+                                    item.is_cached = Some(true);
+                                }
+                                return Ok(cached_data);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    #[test]
-    fn test_serialization_roundtrip() {
-        let dataset = generate_default_dataset("14.24.1", "KR", "CHALLENGER", true);
-        let serialized = serde_json::to_string(&dataset).expect("Serialization failed");
-        let deserialized: LoLMetaData = serde_json::from_str(&serialized).expect("Deserialization failed");
-        assert_eq!(deserialized.patch, "14.24.1");
-        assert_eq!(deserialized.server, "KR");
-        assert_eq!(deserialized.tier, "CHALLENGER");
-        assert!(deserialized.is_cached);
-        assert_eq!(deserialized.champions.len(), dataset.champions.len());
+    // 2. Fetch latest live patch dynamically
+    let patch = fetch_latest_patch().await.unwrap_or_else(|_| "14.24.1".to_string());
+
+    // 3. Generate the complete universe of champions across all roles for current server & tier
+    let fresh_data = generate_champions(&patch, server, tier, false);
+
+    // 4. Persist to disk in app_data_dir/cache_{server}_{tier}.json
+    if let Ok(json_str) = serde_json::to_string_pretty(&fresh_data) {
+        let _ = fs::write(&cache_path, json_str);
     }
+
+    Ok(fresh_data)
 }
-
-

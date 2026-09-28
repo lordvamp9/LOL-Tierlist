@@ -168,7 +168,7 @@ export default function ChampionDetail({ champ, onClose }) {
                 <span className="item-tier-label">SECUENCIA CORE BUILD (3 ÍTEMS)</span>
                 <div className="item-icons-row">
                   {champ.build?.coreItems?.map((it, idx) => (
-                    <div key={it.id} className="item-card-mini" title={`Ítem ${idx + 1}: ${it.name} (${it.cost}g)`}>
+                    <div key={it.id} className="item-card-mini" title={`Ítem #${idx + 1}: ${it.name} (${it.cost}g)`}>
                       <img src={it.iconUrl} alt={it.name} className="item-img" />
                       <div className="item-meta">
                         <span className="item-name">#{idx + 1} {it.name}</span>
@@ -178,6 +178,88 @@ export default function ChampionDetail({ champ, onClose }) {
                   ))}
                 </div>
               </div>
+
+              {/* 4th, 5th, and 6th Item Frequent Options with Win Rates */}
+              {(champ.build?.fourthItems?.length > 0 || champ.build?.fifthItems?.length > 0 || champ.build?.sixthItems?.length > 0) && (
+                <div className="item-tier-group" style={{ marginTop: 4 }}>
+                  <span className="item-tier-label">OPCIONES DE 4º, 5º Y 6º ÍTEM (CON WIN RATE)</span>
+                  
+                  {champ.build?.fourthItems?.length > 0 && (
+                    <div className="item-slot-options-row">
+                      <span className="item-slot-title">4º ÍTEM FRECUENTE:</span>
+                      <div className="item-slot-choices">
+                        {champ.build.fourthItems.map((it) => (
+                          <div key={it.id} className="item-card-choice" title={`${it.name} (${it.cost}g)`}>
+                            <img src={it.iconUrl} alt={it.name} className="item-img" />
+                            <div className="item-meta">
+                              <span className="item-name">{it.name}</span>
+                              {it.category && <span className="item-category-tag">{it.category}</span>}
+                            </div>
+                            {it.winRate && <span className="item-wr-badge">{it.winRate.toFixed(1)}% WR</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {champ.build?.fifthItems?.length > 0 && (
+                    <div className="item-slot-options-row">
+                      <span className="item-slot-title">5º ÍTEM FRECUENTE:</span>
+                      <div className="item-slot-choices">
+                        {champ.build.fifthItems.map((it) => (
+                          <div key={it.id} className="item-card-choice" title={`${it.name} (${it.cost}g)`}>
+                            <img src={it.iconUrl} alt={it.name} className="item-img" />
+                            <div className="item-meta">
+                              <span className="item-name">{it.name}</span>
+                              {it.category && <span className="item-category-tag">{it.category}</span>}
+                            </div>
+                            {it.winRate && <span className="item-wr-badge">{it.winRate.toFixed(1)}% WR</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {champ.build?.sixthItems?.length > 0 && (
+                    <div className="item-slot-options-row">
+                      <span className="item-slot-title">6º ÍTEM DE CIERRE:</span>
+                      <div className="item-slot-choices">
+                        {champ.build.sixthItems.map((it) => (
+                          <div key={it.id} className="item-card-choice" title={`${it.name} (${it.cost}g)`}>
+                            <img src={it.iconUrl} alt={it.name} className="item-img" />
+                            <div className="item-meta">
+                              <span className="item-name">{it.name}</span>
+                              {it.category && <span className="item-category-tag">{it.category}</span>}
+                            </div>
+                            {it.winRate && <span className="item-wr-badge">{it.winRate.toFixed(1)}% WR</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Situational Items Section */}
+              {champ.build?.situationalItems?.length > 0 && (
+                <div className="situational-items-box">
+                  <span className="item-tier-label" style={{ color: '#ffdc73' }}>
+                    ÍTEMS SITUACIONALES CLAVE
+                  </span>
+                  <div className="situational-items-grid">
+                    {champ.build.situationalItems.map((it) => (
+                      <div key={it.id} className="situational-card" title={`${it.name} (${it.cost}g)`}>
+                        <img src={it.iconUrl} alt={it.name} className="item-img" />
+                        <div className="item-meta">
+                          <span className="item-name">{it.name}</span>
+                          <span className="item-cost">{it.cost}g</span>
+                          {it.category && <span className="situational-badge">{it.category}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Ability Max Order */}
               <div className="item-tier-group" style={{ marginTop: 8 }}>
@@ -190,7 +272,7 @@ export default function ChampionDetail({ champ, onClose }) {
                     </React.Fragment>
                   ))}
                   <span style={{ fontSize: 11, color: '#a09b8c', marginLeft: 10 }}>
-                    (Prioridad principal de maxeo)
+                    (Prioridad de maxeo)
                   </span>
                 </div>
               </div>

@@ -1,7 +1,7 @@
 pub mod models;
 pub mod meta_service;
 
-use models::LoLMetaData;
+use models::ChampionRoleData;
 use tauri::{AppHandle, Window};
 
 #[tauri::command]
@@ -10,7 +10,7 @@ async fn get_meta_data(
     server: Option<String>,
     tier: Option<String>,
     force_refresh: Option<bool>,
-) -> Result<LoLMetaData, String> {
+) -> Result<Vec<ChampionRoleData>, String> {
     let s = server.unwrap_or_else(|| "LAS".to_string());
     let t = tier.unwrap_or_else(|| "DIAMOND".to_string());
     let refresh = force_refresh.unwrap_or(false);

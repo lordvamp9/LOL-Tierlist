@@ -49,7 +49,6 @@ export default function TitleBar({ onRefresh, isRefreshing, patch }) {
           </div>
           <h1 className="app-title" data-tauri-drag-region>
             LOL META
-            <span className="app-author-tag" data-tauri-drag-region>vamp9</span>
           </h1>
         </div>
       </div>
@@ -57,7 +56,7 @@ export default function TitleBar({ onRefresh, isRefreshing, patch }) {
       {/* Right actions: Refresh button & Native window controls */}
       <div className="titlebar-actions">
         <button
-          className={`btn-hex-refresh ${isRefreshing ? 'loading' : ''}`}
+          className={`btn-refresh btn-hex-refresh ${isRefreshing ? 'loading' : ''}`}
           onClick={onRefresh}
           title="Actualizar datos desde Data Dragon (Fuerza descarga fresca y actualiza la caché local de 12 horas)"
           disabled={isRefreshing}

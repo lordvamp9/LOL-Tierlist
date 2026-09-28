@@ -44,7 +44,18 @@ export default function App() {
           tier: eloTier,
           forceRefresh,
         });
-        setMetaData(data);
+
+        const champions = Array.isArray(data) ? data : (data?.champions || []);
+        const patch = Array.isArray(data) ? (data[0]?.patch || '14.24.1') : (data?.patch || '14.24.1');
+        const isCached = Array.isArray(data) ? (data[0]?.isCached ?? false) : (data?.isCached ?? false);
+
+        setMetaData({
+          patch,
+          server,
+          tier: eloTier,
+          isCached,
+          champions,
+        });
       } catch (err) {
         console.warn('Native Tauri invoke error or running in web preview:', err);
         setErrorMessage(
@@ -65,53 +76,38 @@ export default function App() {
     fetchMetaData(false);
   }, [fetchMetaData]);
 
-  // Filter & Sort Logic: Real Top 5 Anti-Niche
-  const { top5Champs, excludedCount } = useMemo(() => {
-    if (!metaData || !metaData.champions) {
-      return { top5Champs: [], excludedCount: 0 };
-    }
-
-    // 1. Filter by current active role (CARRY matches both CARRY and BOT)
-    const roleChamps = metaData.champions.filter((c) => {
+  // Universe of champions in the current role
+  const championsInCurrentRole = useMemo(() => {
+    const list = Array.isArray(metaData?.champions) ? metaData.champions : [];
+    const aRole = activeRole.toUpperCase();
+    return list.filter((c) => {
       const cRole = (c.role || '').toUpperCase();
-      const aRole = activeRole.toUpperCase();
       if (aRole === 'CARRY') {
         return cRole === 'CARRY' || cRole === 'BOT';
       }
       return cRole === aRole;
     });
+  }, [metaData, activeRole]);
 
-    // 2. Identify excluded niche picks
-    const qualified = [];
-    let excluded = 0;
+  // Derived Dynamic Top 5 Anti-Niche Calculation
+  const { top5Filtered, excludedCount } = useMemo(() => {
+    const qualified = championsInCurrentRole.filter(
+      (champ) => champ.pickRate >= minPickRate
+    );
+    const excluded = championsInCurrentRole.length - qualified.length;
 
-    for (const champ of roleChamps) {
-      if (champ.pickRate >= minPickRate) {
-        // Weighted Formula Score
-        const bonus = TIER_BONUS[champ.tier] ?? 0;
-        const clampedPr = Math.min(champ.pickRate, 15);
-        const calculatedScore = Number(
-          ((champ.winRate * 0.6) + (clampedPr * 0.4) + bonus).toFixed(2)
-        );
+    // Sort descending by metaScore / score
+    qualified.sort((a, b) => {
+      const scoreB = b.metaScore ?? b.score ?? 0;
+      const scoreA = a.metaScore ?? a.score ?? 0;
+      return scoreB - scoreA;
+    });
 
-        qualified.push({
-          ...champ,
-          score: calculatedScore,
-        });
-      } else {
-        excluded++;
-      }
-    }
-
-    // 3. Sort descending by Score
-    qualified.sort((a, b) => b.score - a.score);
-
-    // 4. Extract Top 5 Real Meta
     return {
-      top5Champs: qualified.slice(0, 5),
+      top5Filtered: qualified.slice(0, 5),
       excludedCount: excluded,
     };
-  }, [metaData, activeRole, minPickRate]);
+  }, [championsInCurrentRole, minPickRate]);
 
   return (
     <div className="classic-window-shell">
@@ -183,7 +179,7 @@ export default function App() {
         {/* Top 5 Champion Cards (Redesigned) */}
         {!isLoading && (
           <div className="champion-cards-stack">
-            {top5Champs.map((champ, index) => (
+            {top5Filtered.map((champ, index) => (
               <ChampionCard
                 key={champ.id}
                 champ={champ}
@@ -192,7 +188,7 @@ export default function App() {
               />
             ))}
 
-            {top5Champs.length === 0 && (
+            {top5Filtered.length === 0 && (
               <div style={{ textAlign: 'center', padding: '40px', color: '#a09b8c' }}>
                 <p>Ningún campeón cumple con el Pick Rate mínimo seleccionado ({minPickRate}%).</p>
                 <p style={{ fontSize: 12, marginTop: 4 }}>

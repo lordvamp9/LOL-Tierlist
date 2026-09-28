@@ -1,7 +1,7 @@
 {
   "name": "lol-classic-meta",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "LoL Classic Meta - Desktop client for League of Legends Top 5 Meta by vamp9",
   "author": "vamp9",

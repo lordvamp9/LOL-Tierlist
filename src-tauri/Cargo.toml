@@ -1,6 +1,6 @@
 [package]
 name = "lol-classic-meta"
-version = "1.0.0"
+version = "1.0.1"
 description = "LoL Classic Meta - Real Top 5 Meta by vamp9"
 authors = ["vamp9"]
 edition = "2021"

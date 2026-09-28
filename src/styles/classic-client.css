@@ -157,12 +157,15 @@ body {
 }
 
 /* Quick Refresh Button (Hexagonal Gem) */
+.btn-refresh,
 .btn-hex-refresh {
   display: flex;
   align-items: center;
   gap: 6px;
   background: linear-gradient(180deg, #1e3648 0%, #0d202e 60%, #06111a 100%);
-  border: 1px solid #c8aa6e;
+  border: 1px solid #785a28 !important;
+  border-radius: 0px !important;
+  clip-path: none !important;
   color: #f0e6d2;
   font-family: 'Cinzel', serif;
   font-size: 11px;
@@ -174,7 +177,6 @@ body {
   overflow: hidden;
   box-shadow: inset 0 0 6px rgba(10, 200, 185, 0.25), 0 0 8px rgba(0, 0, 0, 0.6);
   transition: all 0.2s ease;
-  clip-path: polygon(8px 0, calc(100% - 8px) 0, 100% 8px, 100% calc(100% - 8px), calc(100% - 8px) 100%, 8px 100%, 0 calc(100% - 8px), 0 8px);
 }
 
 .btn-hex-refresh:hover {
@@ -443,6 +445,11 @@ body {
   height: 20px;
   object-fit: contain;
   filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
+}
+
+img[alt="Esmeralda"], img[src*="emerald"] {
+  transform: scale(1.35);
+  transform-origin: center;
 }
 
 .elo-label-text {
@@ -1167,6 +1174,107 @@ body {
 .item-cost {
   font-size: 10px;
   color: #ffdc73;
+}
+
+/* 4th, 5th, 6th Option Rows */
+.item-slot-options-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(5, 12, 18, 0.6);
+  padding: 8px 10px;
+  border: 1px solid rgba(120, 90, 40, 0.35);
+}
+
+.item-slot-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: #ffdc73;
+  letter-spacing: 0.5px;
+}
+
+.item-slot-choices {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.item-card-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(6, 13, 19, 0.85);
+  border: 1px solid #785a28;
+  padding: 4px 8px;
+  border-radius: 2px;
+  flex: 1;
+  min-width: 140px;
+  transition: all 0.2s;
+}
+
+.item-card-choice:hover {
+  border-color: #c8aa6e;
+  box-shadow: 0 0 8px rgba(200, 170, 110, 0.4);
+}
+
+.item-wr-badge {
+  font-family: 'Cinzel', serif;
+  font-size: 10px;
+  font-weight: 800;
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.12);
+  border: 1px solid rgba(74, 222, 128, 0.35);
+  padding: 2px 5px;
+  border-radius: 2px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.item-category-tag {
+  font-size: 9px;
+  color: #8a9ba8;
+}
+
+/* Situational Items Container */
+.situational-items-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(8, 16, 24, 0.7);
+  padding: 10px 12px;
+  border: 1px solid #785a28;
+  margin-top: 4px;
+}
+
+.situational-items-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.situational-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(4, 9, 14, 0.9);
+  border: 1px solid rgba(200, 170, 110, 0.3);
+  padding: 5px 8px;
+}
+
+.situational-card:hover {
+  border-color: #f0e6d2;
+}
+
+.situational-badge {
+  font-size: 9px;
+  font-weight: 700;
+  color: #0ac8b9;
+  background: rgba(10, 200, 185, 0.15);
+  padding: 1px 5px;
+  border-radius: 2px;
+  display: inline-block;
+  margin-top: 2px;
 }
 
 /* Skills Max Order Bar */
