@@ -1,4 +1,4 @@
-# LOL META (Season 3 Client Aesthetic)
+# LOL META
 
 <div align="center">
 
@@ -19,7 +19,7 @@
 
 ---
 
-## 📖 Descripción General
+##  Descripción General
 
 **LOL META** es una aplicación de escritorio open source construida con **Tauri v2, Rust y React**, diseñada con la legendaria estética del cliente clásico de League of Legends Season 3 (2013).
 
@@ -27,7 +27,7 @@ Su objetivo primordial es resolver el problema de las plataformas estadísticas 
 
 ---
 
-## ⚡ Algoritmo de Cálculo Ponderado (Anti-Niche Picks)
+##  Algoritmo de Cálculo Ponderado (Anti-Niche Picks)
 
 A diferencia de los ordenamientos ingenuos basados únicamente en Win Rate, **LOL META** utiliza una fórmula de puntuación ponderada:
 
@@ -45,7 +45,7 @@ $$\text{Score} = (\text{WinRate} \times 0.6) + (\min(\text{PickRate}, 15) \times
 
 ---
 
-## ✨ Funcionalidades Clave
+##  Funcionalidades Clave
 
 - **Selector de Servidor / Región:** Soporte para `LAS`, `LAN`, `NA`, `EUW`, `EUNE`, `KR` y `BR`.
 - **Selector de Rango / División (Elo):** Dropdown clásico que muestra los emblemas oficiales de ligas de Riot Games (`HIERRO`, `BRONCE`, `PLATA`, `ORO`, `PLATINO`, `ESMERALDA`, `DIAMANTE`, `MAESTRO`, `GRAN MAESTRO`, `RETADOR`).
@@ -96,11 +96,11 @@ $$\text{Score} = (\text{WinRate} \times 0.6) + (\min(\text{PickRate}, 15) \times
 
 ---
 
-## 📥 Descarga e Instalación
+##  Descarga e Instalación
 
 ### Descarga del Instalador Precompilado (`setup.exe`)
 Puedes descargar directamente el instalador oficial para Windows desde la sección de lanzamientos:
-👉 **[Descargar última versión en GitHub Releases](https://github.com/lordvamp9/LOL-Tierlist/releases)**
+ **[Descargar última versión en GitHub Releases](https://github.com/lordvamp9/LOL-Tierlist/releases)**
 
 ### Ejecución en Modo Desarrollo
 Si deseas clonar el proyecto y compilarlo en tu máquina:
@@ -130,7 +130,7 @@ docker compose run --rm builder
 
 ---
 
-## ⚖️ Descargo de Responsabilidad (Riot Legal Jibber Jabber)
+##  Descargo de Responsabilidad (Riot Legal Jibber Jabber)
 
 > *LOL META no cuenta con el respaldo de Riot Games y no refleja las opiniones ni los puntos de vista de Riot Games ni de nadie involucrado oficialmente en la producción o administración de las propiedades de Riot Games. Riot Games y todas las propiedades asociadas son marcas comerciales o marcas comerciales registradas de Riot Games, Inc.*
 
