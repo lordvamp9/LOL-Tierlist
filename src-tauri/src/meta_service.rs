@@ -215,4 +215,13 @@ mod tests {
         assert!(json_str.contains("\"coreItems\":"), "Debe serializar como camelCase coreItems");
         assert!(json_str.contains("\"metaScore\":"), "Debe serializar como camelCase metaScore");
     }
+
+    #[tokio::test]
+    async fn test_live_fetch_from_github() {
+        let champs = fetch_from_github("LAS", "DIAMOND").await
+            .expect("fetch_from_github debe obtener y parsear exitosamente los datos desde raw.githubusercontent.com");
+        assert!(!champs.is_empty(), "La respuesta remota de GitHub no debe estar vacia");
+        assert_eq!(champs[0].patch.as_deref(), Some("16.19.1"), "Debe contener el parche real 16.19.1");
+        assert!(champs.iter().any(|c| c.name == "Tryndamere" || c.name == "Garen"), "Debe contener campeones reales");
+    }
 }
