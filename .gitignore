@@ -6,6 +6,7 @@
 
 # Dependencias y Bundles Frontend
 node_modules/
+**/node_modules/
 dist/
 .turbo/
 release-assets/

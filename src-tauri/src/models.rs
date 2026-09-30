@@ -87,6 +87,16 @@ pub struct ChampionRoleData {
     pub patch: Option<String>,
     #[serde(default)]
     pub is_cached: Option<bool>,
+    #[serde(default)]
+    pub starter_items: Option<Vec<u32>>,
+    #[serde(default)]
+    pub core_items: Option<Vec<u32>>,
+    #[serde(default)]
+    pub situational_items: Option<Vec<u32>>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub tier_rank: Option<String>,
 }
 
 pub type ChampionStat = ChampionRoleData;

@@ -47,17 +47,19 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'LOL META Release ${{ github.ref_name }}'
           releaseBody: |
-            ## LOL META Desktop Client — Release ${{ github.ref_name }}
+            ## LOL META Desktop Client - Release ${{ github.ref_name }}
             
-            ### 🎮 Novedades y Características:
-            - **Cliente Season 3 (2013):** Diseño retro clásico fiel de League of Legends.
-            - **Top 5 Meta Real:** Algoritmo ponderado anti-niche picks para el parche actual.
-            - **Filtros Funcionales:** Selector de Servidor (LAS, LAN, NA, EUW, KR, BR) y Elo (Hierro a Retador).
-            - **Caché Offline:** Persistencia local con TTL de 12 horas.
-            - **100% Vanguard Safe:** Cero inyección de memoria ni hooks; consume exclusivamente estadísticas públicas vía CDN.
+            ### Correccion Critica de Datos y Mejoras de Arquitectura:
+            - **Correccion de Datos Reales:** Se subsano un error de programacion previo donde el cliente utilizaba datos simulados (mocks) hardcodeados debido a bloqueos de Cloudflare. A partir de esta version, la aplicacion consume datos 100% veridicos y reales del meta actual sincronizados directamente desde OP.GG y Riot Games Data Dragon a traves de la CDN de GitHub.
+            - **Arquitectura Desacoplada:** Backend Rust/Tauri optimizado para consultar archivos JSON estructurados sin riesgo de bloqueos.
+            - **Cliente Season 3 (2013):** Diseno retro clasico fiel de League of Legends.
+            - **Top 5 Meta Real:** Algoritmo ponderado anti-niche picks para el parche activo.
+            - **Filtros Funcionales:** Selector de Servidor (LAS, LAN, NA, EUW, KR, BR) y Rango Elo (Hierro a Retador).
+            - **Cache Offline Robusta:** Persistencia local en disco con TTL de 12 horas y respaldo embebido.
+            - **100% Vanguard Safe:** Cero inyeccion de memoria o hooks al cliente de juego; consumo exclusivo de estadisticas publicas.
             
-            ### 📦 Descarga del Instalador:
-            Descarga el archivo ejecutable adjunto abajo (`.exe`) e instálalo en tu sistema Windows.
+            ### Descarga del Instalador:
+            Descarga el archivo ejecutable adjunto abajo (.exe o instalador msi) e instalalo en tu sistema Windows.
           releaseDraft: false
           prerelease: false
           args: --verbose

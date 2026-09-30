@@ -1,0 +1,38 @@
+name: Sincronizar Datos Meta LoL
+
+on:
+  schedule:
+    # Ejecución automática diaria a las 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Permite ejecución manual con un clic desde GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  sync-meta:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias del script
+        run: |
+          cd scripts
+          npm init -y
+          npm install axios cheerio
+
+      - name: Ejecutar Extractor de Estadísticas
+        run: node scripts/fetch-meta.js
+
+      - name: Commitear y Actualizar JSON en el repositorio
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: sync live meta data from OP.GG [skip ci]" && git push)

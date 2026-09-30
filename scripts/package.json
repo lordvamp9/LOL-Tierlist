@@ -1,0 +1,13 @@
+{
+  "name": "lol-meta-extractor",
+  "version": "1.0.0",
+  "description": "Extractor automatizado de estadísticas OP.GG y Data Dragon para LOL META por vamp9",
+  "main": "fetch-meta.js",
+  "type": "commonjs",
+  "author": "vamp9",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0"
+  }
+}
